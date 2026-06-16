@@ -1,0 +1,6 @@
+/target
+**/*.img
+**/*.iso
+**/*.pdb
+.DS_Store
+Thumbs.db
