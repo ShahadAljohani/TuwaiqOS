@@ -1,0 +1,278 @@
+//! IDT, legacy PIC routing, PIT timer tick, and CPU exception handlers.
+//!
+//! This is the subsystem that turns TuwaiqOS from a purely polled kernel
+//! into one that reacts to hardware asynchronously: the timer interrupt
+//! drives the tick counter (and, from Phase 3 on, preemption), and the
+//! keyboard interrupt replaces the old busy-poll loop in `keyboard.rs`.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use lazy_static::lazy_static;
+use pic8259::ChainedPics;
+use spin::Mutex;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+
+use crate::{framebuffer_console, gdt, keyboard};
+
+/// Legacy PICs are remapped so hardware IRQs 0-15 land at vectors 32-47,
+/// clear of the CPU's own exception vectors 0-31.
+pub const PIC_1_OFFSET: u8 = 32;
+pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
+
+/// Safety: 0x20/0xA0 (master) and 0x21/0xA1 (slave) are the fixed legacy
+/// PIC I/O ports on the PC platform; this is the one and only PIC handle
+/// for the kernel, so there is no risk of two owners racing the hardware.
+pub static PICS: Mutex<ChainedPics> =
+    unsafe { Mutex::new(ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET)) };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InterruptIndex {
+    Timer = PIC_1_OFFSET,
+    Keyboard,
+}
+
+impl InterruptIndex {
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn as_usize(self) -> usize {
+        usize::from(self.as_u8())
+    }
+}
+
+static TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// PIT channel 0 is programmed for this frequency in `init_pit`.
+const TIMER_HZ: u64 = 100;
+
+/// Raw tick count since the timer interrupt was enabled.
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+/// Whole seconds of uptime, derived from the real timer tick count -- not
+/// a placeholder string. Zero until `init()` has enabled the PIT.
+pub fn uptime_seconds() -> u64 {
+    ticks() / TIMER_HZ
+}
+
+/// Halt the CPU until the next interrupt fires (timer or keyboard). Used by
+/// the shell's input loop instead of a CPU-burning empty spin.
+pub fn halt() {
+    x86_64::instructions::hlt();
+}
+
+lazy_static! {
+    static ref IDT: InterruptDescriptorTable = {
+        let mut idt = InterruptDescriptorTable::new();
+
+        idt.breakpoint.set_handler_fn(breakpoint_handler);
+        idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.general_protection_fault
+            .set_handler_fn(general_protection_fault_handler);
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        idt.divide_error.set_handler_fn(divide_error_handler);
+
+        // Safety: DOUBLE_FAULT_IST_INDEX names a stack gdt::init() already
+        // installed into the TSS before this IDT is loaded.
+        unsafe {
+            idt.double_fault
+                .set_handler_fn(double_fault_handler)
+                .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+        }
+
+        // Safety: IRQ_IST_INDEX names a stack gdt::init() already installed
+        // into the TSS before this IDT is loaded. See gdt::IRQ_IST_INDEX
+        // for why hardware IRQs get a dedicated stack.
+        unsafe {
+            idt[InterruptIndex::Timer.as_usize()]
+                .set_handler_fn(timer_interrupt_handler)
+                .set_stack_index(gdt::IRQ_IST_INDEX);
+            idt[InterruptIndex::Keyboard.as_usize()]
+                .set_handler_fn(keyboard_interrupt_handler)
+                .set_stack_index(gdt::IRQ_IST_INDEX);
+        }
+
+        idt
+    };
+}
+
+/// Bring up GDT, IDT, PIC remap, and the PIT timer, then enable interrupts.
+/// Must run after the heap is initialized (the keyboard queue allocates)
+/// and before anything expects `poll_key()` or `uptime_seconds()` to be live.
+pub fn init() {
+    gdt::init();
+    IDT.load();
+
+    // Self-test: a software breakpoint exercises the full IDT/GDT/IRETQ
+    // path (the same mechanism every exception and IRQ handler relies on)
+    // before any hardware interrupt is ever allowed to fire. If this
+    // doesn't return cleanly, nothing past this point can be trusted.
+    x86_64::instructions::interrupts::int3();
+    serial_println!("interrupts: breakpoint self-test OK");
+
+    // Safety: PIC_1_OFFSET/PIC_2_OFFSET move IRQs 0-15 to vectors 32-47,
+    // matching the vectors registered above, and this runs exactly once
+    // before interrupts are enabled.
+    //
+    // `ChainedPics::initialize()` *preserves* whatever IRQ mask the BIOS
+    // left rather than resetting it -- diagnosed during Phase 1 bring-up:
+    // SeaBIOS leaves several lines unmasked (IRQ14, the primary ATA/IDE
+    // controller, among them), and this kernel only registers IDT entries
+    // for vectors 32 (timer) and 33 (keyboard). A hardware IRQ landing on
+    // any other, not-present vector -- entirely plausible the moment
+    // `ata::read_sector`'s polling loop below causes the disk controller
+    // to raise IRQ14 -- produced an unrecoverable fault with no handler
+    // to attribute it to. Only the two lines this kernel actually
+    // services are left unmasked; everything else, including the PIC2
+    // cascade line, is masked until a real driver for it exists.
+    unsafe {
+        let mut pics = PICS.lock();
+        pics.initialize();
+        pics.write_masks(0b1111_1100, 0b1111_1111);
+    }
+    serial_println!("interrupts: PIC remapped, only timer+keyboard IRQs unmasked");
+
+    init_pit(TIMER_HZ);
+    serial_println!("interrupts: PIT programmed");
+
+    x86_64::instructions::interrupts::enable();
+    serial_println!("interrupts: IDT/PIC/PIT online, timer at {} Hz", TIMER_HZ);
+}
+
+/// Program PIT channel 0 (legacy 8253/8254) for a periodic square-wave
+/// interrupt at `hz`. 1_193_182 Hz is the PIT's fixed input clock.
+fn init_pit(hz: u64) {
+    use x86_64::instructions::port::Port;
+
+    const PIT_INPUT_HZ: u64 = 1_193_182;
+    let divisor = (PIT_INPUT_HZ / hz) as u16;
+
+    // Safety: 0x43 (mode/command) and 0x40 (channel 0 data) are the fixed
+    // legacy PIT ports; this sequence (command byte, then low/high divisor
+    // bytes) is the documented 8253/8254 programming protocol and runs
+    // once, before interrupts are enabled.
+    unsafe {
+        let mut command: Port<u8> = Port::new(0x43);
+        let mut channel0: Port<u8> = Port::new(0x40);
+        command.write(0x36u8); // channel 0, lo/hi byte access, mode 3, binary
+        channel0.write((divisor & 0xFF) as u8);
+        channel0.write((divisor >> 8) as u8);
+    }
+}
+
+/// Print a fault to serial (always -- the only channel a fault handler can
+/// trust unconditionally, since it's port I/O, not memory-mapped) and to
+/// the framebuffer console *only if it is confirmed initialized*.
+///
+/// Discovered during Phase 1 bring-up: this bootloader's page tables do
+/// not map the legacy VGA text buffer (0xB8000) at all in this boot
+/// configuration, framebuffer or not. v0.5's original panic handler wrote
+/// to `vga_buffer` unconditionally, but that path was simply never
+/// exercised (it never panicked); the first fault handler that actually
+/// ran here turned a single fault into a recursive page-fault storm
+/// against unmapped memory. Until Phase 2 gives us real page-table
+/// introspection to check mappings before writing, VGA is treated as
+/// untrustworthy from a fault context and is not used here at all.
+fn report_fault(name: &str) {
+    if framebuffer_console::is_active() {
+        framebuffer_console::println("");
+        framebuffer_console::println("KERNEL PANIC: ");
+        framebuffer_console::println(name);
+    }
+}
+
+extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
+    serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
+}
+
+extern "x86-interrupt" fn double_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) -> ! {
+    serial_println!(
+        "EXCEPTION: DOUBLE FAULT (error_code={})\n{:#?}",
+        error_code,
+        stack_frame
+    );
+    report_fault("double fault");
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    let fault_addr = x86_64::registers::control::Cr2::read();
+    serial_println!(
+        "EXCEPTION: PAGE FAULT at {:?}\nerror_code={:?}\n{:#?}",
+        fault_addr,
+        error_code,
+        stack_frame
+    );
+    report_fault("page fault");
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    serial_println!(
+        "EXCEPTION: GENERAL PROTECTION FAULT (error_code={})\n{:#?}",
+        error_code,
+        stack_frame
+    );
+    report_fault("general protection fault");
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    serial_println!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
+    report_fault("invalid opcode");
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
+    serial_println!("EXCEPTION: DIVIDE ERROR\n{:#?}", stack_frame);
+    report_fault("divide error");
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    TICKS.fetch_add(1, Ordering::Relaxed);
+    // Safety: EOI is only ever issued here, for the interrupt this ISR
+    // itself is handling, matching the IRQ this vector is registered for.
+    unsafe {
+        PICS.lock()
+            .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+    }
+}
+
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    use x86_64::instructions::port::Port;
+
+    let mut data_port: Port<u8> = Port::new(0x60);
+    // Safety: the CPU only vectors here in response to IRQ1, at which
+    // point the PS/2 controller guarantees a byte is waiting at 0x60.
+    let scancode: u8 = unsafe { data_port.read() };
+    keyboard::on_scancode(scancode);
+
+    // Safety: same reasoning as the timer handler above.
+    unsafe {
+        PICS.lock()
+            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}

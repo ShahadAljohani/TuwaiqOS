@@ -38,7 +38,11 @@ impl StubAiBridge {
     /// Multi-line response for `ask <question>`.
     pub fn ask(&self, question: &str) -> String {
         let trimmed = question.trim();
-        let display = if trimmed.is_empty() { "(empty)" } else { trimmed };
+        let display = if trimmed.is_empty() {
+            "(empty)"
+        } else {
+            trimmed
+        };
 
         let mut response = String::from("AI Bridge: offline\nQuestion: ");
         response.push_str(display);
@@ -48,12 +52,7 @@ impl StubAiBridge {
 
     /// Lines printed by `ai help`.
     pub fn help_lines(&self) -> [&'static str; 4] {
-        [
-            "AI commands:",
-            "ask <question>",
-            "ai status",
-            "ai help",
-        ]
+        ["AI commands:", "ask <question>", "ai status", "ai help"]
     }
 
     /// Short message for the bare `ai` command.

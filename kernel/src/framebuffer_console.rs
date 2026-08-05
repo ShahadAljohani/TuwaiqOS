@@ -28,6 +28,18 @@ static mut FB_INFO: Option<FrameBufferInfo> = None;
 static mut CURSOR_X: usize = 0;
 static mut CURSOR_Y: usize = 0;
 
+/// Whether the framebuffer console is the active console. Fault/panic paths
+/// use this to decide which console is *safe* to write to: on a graphical
+/// boot the legacy VGA text buffer (0xB8000) is typically not mapped at
+/// all, so blindly writing to both consoles (as v0.5's panic handler did)
+/// can turn a fault handler into a fault storm against unmapped memory.
+pub fn is_active() -> bool {
+    // Safety: reads through a raw pointer rather than `&FB_INFO`, matching
+    // the pattern the rest of this module already uses to avoid creating a
+    // live shared reference to a `static mut`.
+    unsafe { (*core::ptr::addr_of!(FB_INFO)).is_some() }
+}
+
 /// Attach the console to the bootloader-provided framebuffer.
 pub fn init(framebuffer: &mut FrameBuffer) {
     let info = framebuffer.info();
@@ -78,10 +90,8 @@ pub fn backspace() {
         CURSOR_X -= 1;
     }
 
-    with_console(|info| {
-        unsafe {
-            draw_glyph(info, b' ', CURSOR_X, CURSOR_Y);
-        }
+    with_console(|info| unsafe {
+        draw_glyph(info, b' ', CURSOR_X, CURSOR_Y);
     });
 }
 
@@ -166,7 +176,16 @@ fn draw_glyph(info: FrameBufferInfo, ch: u8, col: usize, row: usize) {
     let base_x = col * CHAR_WIDTH;
     let base_y = row * CHAR_HEIGHT;
 
-    fill_rect(info, base_x, base_y, CHAR_WIDTH, CHAR_HEIGHT, BG_R, BG_G, BG_B);
+    fill_rect(
+        info,
+        base_x,
+        base_y,
+        CHAR_WIDTH,
+        CHAR_HEIGHT,
+        BG_R,
+        BG_G,
+        BG_B,
+    );
 
     for (font_y, row_bits) in glyph.iter().enumerate().take(FONT_HEIGHT) {
         for font_x in 0..FONT_WIDTH {

@@ -13,10 +13,14 @@
 - [x] Program loader (`run hello`, `run demo`)
 - [x] Built-in apps: `notes`, `editor`, `monitor`
 
-## v0.6 — planned
+## v0.6 — in progress
 
+- [x] Real interrupt architecture: GDT/TSS, IDT with exception handlers,
+      PIC remap, PIT timer tick, interrupt-driven keyboard, real `uptime`
+- [ ] Preemptive scheduler with context switching (timer tick exists; task
+      switching itself does not yet)
+- [ ] Physical frame allocator + paging
 - [ ] ELF program loader
-- [ ] Preemptive scheduler with timer interrupts
 - [ ] Real NIC driver (e1000 / virtio-net)
 - [ ] AI Bridge HTTP client wired to gateway
 - [ ] `cd` command and path-aware completion

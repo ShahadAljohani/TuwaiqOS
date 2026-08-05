@@ -11,7 +11,8 @@ use bootloader_api::{info::MemoryRegionKind, BootInfo};
 use crate::ai_bridge;
 use crate::apps::{editor, monitor, notes};
 use crate::fs;
-use crate::keyboard::{KeyEvent, poll_key};
+use crate::interrupts;
+use crate::keyboard::{poll_key, KeyEvent};
 use crate::loader;
 use crate::memory;
 use crate::net;
@@ -115,7 +116,10 @@ pub fn run(boot_info: &'static BootInfo, mode: ConsoleMode) -> ! {
 
         loop {
             match poll_key() {
-                KeyEvent::None => {}
+                // Nothing queued: halt until the next interrupt (timer or
+                // keyboard) instead of burning CPU re-checking the queue.
+                // v0.5 busy-polled ports 0x60/0x64 directly in this spot.
+                KeyEvent::None => interrupts::halt(),
                 KeyEvent::Char(ch) => {
                     if len < MAX_LINE {
                         line[len] = ch;
@@ -268,12 +272,15 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "help" => print_help(mode),
         "about" => {
             println(mode, "TuwaiqOS");
-            println(mode, "Experimental AI-Native Operating System written in Rust.");
+            println(
+                mode,
+                "Experimental AI-Native Operating System written in Rust.",
+            );
         }
         "version" => println(mode, "TuwaiqOS v0.5"),
         "banner" => print_banner(mode),
         "sysinfo" => print_sysinfo(boot_info, mode),
-        "uptime" => println(mode, "timer not available yet"),
+        "uptime" => print_uptime(mode),
         "reboot" => reboot::system(),
         "clear" | "cls" => clear_screen(mode),
         "echo" => println(mode, args),
@@ -597,6 +604,15 @@ fn handle_ask_command(mode: ConsoleMode, question: &str) {
     }
 }
 
+fn print_uptime(mode: ConsoleMode) {
+    let seconds = interrupts::uptime_seconds();
+    print(mode, "Uptime: ");
+    print_u64(mode, seconds);
+    print(mode, " s (");
+    print_u64(mode, interrupts::ticks());
+    println(mode, " timer ticks)");
+}
+
 fn print_fs_error(mode: ConsoleMode, reason: &str) {
     print(mode, "Filesystem error: ");
     println(mode, reason);
@@ -604,7 +620,10 @@ fn print_fs_error(mode: ConsoleMode, reason: &str) {
 
 fn print_help(mode: ConsoleMode) {
     println(mode, "Commands:");
-    println(mode, "  help | about | version | banner | sysinfo | monitor");
+    println(
+        mode,
+        "  help | about | version | banner | sysinfo | monitor",
+    );
     println(mode, "  uptime | reboot | clear | cls | echo <text>");
     println(mode, "  meminfo | memtest");
     println(mode, "  ls | pwd | touch | mkdir | cat | write");
@@ -633,6 +652,9 @@ fn print_sysinfo(boot_info: &BootInfo, mode: ConsoleMode) {
     println(mode, "System Information");
     println(mode, "  OS: TuwaiqOS v0.5");
     println(mode, "  Architecture: x86_64");
+    print(mode, "  Uptime: ");
+    print_u64(mode, interrupts::uptime_seconds());
+    println(mode, " s");
     print(mode, "  Usable RAM: ");
     print_u64(mode, usable_bytes);
     println(mode, " bytes");
@@ -658,10 +680,9 @@ fn print_sysinfo(boot_info: &BootInfo, mode: ConsoleMode) {
 
 fn command_names() -> &'static [&'static str] {
     &[
-        "help", "about", "version", "banner", "sysinfo", "monitor", "uptime", "reboot",
-        "clear", "cls", "echo", "meminfo", "memtest", "ls", "pwd", "touch", "mkdir", "cat",
-        "write", "ps", "taskinfo", "kill", "net", "ping", "run", "notes", "editor", "ai",
-        "ask",
+        "help", "about", "version", "banner", "sysinfo", "monitor", "uptime", "reboot", "clear",
+        "cls", "echo", "meminfo", "memtest", "ls", "pwd", "touch", "mkdir", "cat", "write", "ps",
+        "taskinfo", "kill", "net", "ping", "run", "notes", "editor", "ai", "ask",
     ]
 }
 

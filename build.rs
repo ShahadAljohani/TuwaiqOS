@@ -85,19 +85,32 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Track every kernel source file, not a hand-maintained subset.
+///
+/// A hardcoded file list here previously omitted several modules (this is
+/// how, during Phase 1 interrupt work, `gdt.rs`/`interrupts.rs`/`serial.rs`
+/// went unlisted): Cargo saw nothing *this build script itself watches*
+/// had changed and skipped rerunning it, silently repackaging a stale
+/// kernel ELF into the disk image for several rebuild-and-test cycles.
+/// Walking the actual directory tree makes that class of bug structurally
+/// impossible -- a new module is tracked the moment its file exists.
 fn track_kernel_sources() {
     println!("cargo:rerun-if-changed=kernel/Cargo.toml");
-    println!("cargo:rerun-if-changed=kernel/src/main.rs");
-    println!("cargo:rerun-if-changed=kernel/src/keyboard.rs");
-    println!("cargo:rerun-if-changed=kernel/src/shell.rs");
-    println!("cargo:rerun-if-changed=kernel/src/framebuffer_console.rs");
-    println!("cargo:rerun-if-changed=kernel/src/vga_buffer.rs");
-    println!("cargo:rerun-if-changed=kernel/src/fs.rs");
-    println!("cargo:rerun-if-changed=kernel/src/ata.rs");
-    println!("cargo:rerun-if-changed=kernel/src/tuwaiqfs.rs");
-    println!("cargo:rerun-if-changed=kernel/src/task.rs");
-    println!("cargo:rerun-if-changed=kernel/src/reboot.rs");
-    println!("cargo:rerun-if-changed=kernel/src/net/mod.rs");
+    let mut dirs = std::collections::VecDeque::new();
+    dirs.push_back(PathBuf::from("kernel/src"));
+    while let Some(dir) = dirs.pop_front() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push_back(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
 }
 
 fn print_build_environment() {

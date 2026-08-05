@@ -1,8 +1,21 @@
-//! PS/2 keyboard input (polling mode).
+//! PS/2 keyboard input (interrupt-driven).
+//!
+//! Scancodes arrive one byte at a time from `interrupts::keyboard_interrupt_handler`
+//! (IRQ1), are decoded here into `KeyEvent`s, and queued for the shell to
+//! drain with `poll_key()`. This replaces the v0.5 implementation, which
+//! re-read ports 0x60/0x64 in a tight loop from the shell's own input loop;
+//! `poll_key()` keeps its exact old signature so `shell.rs` needed no changes.
 //!
 //! Supports printable keys, Shift modifiers, arrow keys, and Tab.
 
+use alloc::collections::VecDeque;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use lazy_static::lazy_static;
+use spin::Mutex;
+
 /// A decoded keyboard event for the shell.
+#[derive(Clone, Copy)]
 pub enum KeyEvent {
     Char(u8),
     Enter,
@@ -13,72 +26,94 @@ pub enum KeyEvent {
     None,
 }
 
-static mut LEFT_SHIFT: bool = false;
-static mut RIGHT_SHIFT: bool = false;
+static LEFT_SHIFT: AtomicBool = AtomicBool::new(false);
+static RIGHT_SHIFT: AtomicBool = AtomicBool::new(false);
+/// Set after seeing the 0xE0 extended-scancode prefix; the *next* byte
+/// delivered by IRQ1 completes that two-byte sequence.
+static EXTENDED_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn shift_active() -> bool {
-    unsafe { LEFT_SHIFT || RIGHT_SHIFT }
+    LEFT_SHIFT.load(Ordering::Relaxed) || RIGHT_SHIFT.load(Ordering::Relaxed)
 }
 
-/// Poll the keyboard once. Returns immediately if no key is waiting.
-pub fn poll_key() -> KeyEvent {
-    unsafe {
-        if inb(STATUS_PORT) & 0x01 == 0 {
-            return KeyEvent::None;
+const QUEUE_CAPACITY: usize = 32;
+
+lazy_static! {
+    static ref QUEUE: Mutex<VecDeque<KeyEvent>> =
+        Mutex::new(VecDeque::with_capacity(QUEUE_CAPACITY));
+}
+
+/// Feed one raw scancode byte in from the keyboard ISR. Runs with
+/// interrupts disabled (we're inside the ISR), so this must stay fast and
+/// must never block.
+pub fn on_scancode(scancode: u8) {
+    if EXTENDED_PENDING.swap(false, Ordering::Relaxed) {
+        if let Some(event) = translate_extended(scancode) {
+            push(event);
         }
+        return;
+    }
 
-        let scancode = inb(DATA_PORT);
+    if scancode == 0xE0 {
+        EXTENDED_PENDING.store(true, Ordering::Relaxed);
+        return;
+    }
 
-        // Extended scancodes (arrow keys) are prefixed with 0xE0.
-        if scancode == 0xE0 {
-            if inb(STATUS_PORT) & 0x01 == 0 {
-                return KeyEvent::None;
-            }
-            let extended = inb(DATA_PORT);
-            return translate_extended(extended);
-        }
-
-        translate_scancode(scancode)
+    if let Some(event) = translate_scancode(scancode) {
+        push(event);
     }
 }
 
-const DATA_PORT: u16 = 0x60;
-const STATUS_PORT: u16 = 0x64;
+fn push(event: KeyEvent) {
+    let mut queue = QUEUE.lock();
+    if queue.len() < QUEUE_CAPACITY {
+        queue.push_back(event);
+    }
+    // Silently drop when full: better to lose an unread keystroke than to
+    // block the ISR or grow the queue unbounded.
+}
 
-fn translate_extended(scancode: u8) -> KeyEvent {
+/// Drain one queued key event. Returns `KeyEvent::None` immediately if
+/// nothing is waiting -- callers that want to idle instead of spin should
+/// call `interrupts::halt()` on `None` (see `shell::run`).
+pub fn poll_key() -> KeyEvent {
+    QUEUE.lock().pop_front().unwrap_or(KeyEvent::None)
+}
+
+fn translate_extended(scancode: u8) -> Option<KeyEvent> {
     if scancode & 0x80 != 0 {
-        return KeyEvent::None;
+        return None;
     }
     match scancode {
-        0x48 => KeyEvent::ArrowUp,
-        0x50 => KeyEvent::ArrowDown,
-        _ => KeyEvent::None,
+        0x48 => Some(KeyEvent::ArrowUp),
+        0x50 => Some(KeyEvent::ArrowDown),
+        _ => None,
     }
 }
 
-fn translate_scancode(scancode: u8) -> KeyEvent {
+fn translate_scancode(scancode: u8) -> Option<KeyEvent> {
     if scancode & 0x80 != 0 {
         match scancode {
-            0xAA => unsafe { LEFT_SHIFT = false },
-            0xB6 => unsafe { RIGHT_SHIFT = false },
+            0xAA => LEFT_SHIFT.store(false, Ordering::Relaxed),
+            0xB6 => RIGHT_SHIFT.store(false, Ordering::Relaxed),
             _ => {}
         }
-        return KeyEvent::None;
+        return None;
     }
 
     match scancode {
         0x2A => {
-            unsafe { LEFT_SHIFT = true };
-            KeyEvent::None
+            LEFT_SHIFT.store(true, Ordering::Relaxed);
+            None
         }
         0x36 => {
-            unsafe { RIGHT_SHIFT = true };
-            KeyEvent::None
+            RIGHT_SHIFT.store(true, Ordering::Relaxed);
+            None
         }
-        0x1C => KeyEvent::Enter,
-        0x0E => KeyEvent::Backspace,
-        0x0F => KeyEvent::Tab,
-        0x39 => KeyEvent::Char(b' '),
+        0x1C => Some(KeyEvent::Enter),
+        0x0E => Some(KeyEvent::Backspace),
+        0x0F => Some(KeyEvent::Tab),
+        0x39 => Some(KeyEvent::Char(b' ')),
         0x02 => emit_pair(b'1', b'!'),
         0x03 => emit_pair(b'2', b'@'),
         0x04 => emit_pair(b'3', b'#'),
@@ -126,34 +161,22 @@ fn translate_scancode(scancode: u8) -> KeyEvent {
         0x30 => emit_letter(b'b'),
         0x31 => emit_letter(b'n'),
         0x32 => emit_letter(b'm'),
-        _ => KeyEvent::None,
+        _ => None,
     }
 }
 
-fn emit_pair(normal: u8, shifted: u8) -> KeyEvent {
-    if shift_active() {
-        KeyEvent::Char(shifted)
+fn emit_pair(normal: u8, shifted: u8) -> Option<KeyEvent> {
+    Some(KeyEvent::Char(if shift_active() {
+        shifted
     } else {
-        KeyEvent::Char(normal)
-    }
+        normal
+    }))
 }
 
-fn emit_letter(lower: u8) -> KeyEvent {
-    if shift_active() {
-        KeyEvent::Char(lower - b'a' + b'A')
+fn emit_letter(lower: u8) -> Option<KeyEvent> {
+    Some(KeyEvent::Char(if shift_active() {
+        lower - b'a' + b'A'
     } else {
-        KeyEvent::Char(lower)
-    }
-}
-
-#[inline(always)]
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    core::arch::asm!(
-        "in al, dx",
-        out("al") value,
-        in("dx") port,
-        options(nomem, nostack, preserves_flags)
-    );
-    value
+        lower
+    }))
 }

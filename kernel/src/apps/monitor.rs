@@ -24,7 +24,11 @@ pub fn snapshot(boot_info: &BootInfo) -> Result<Vec<String>, &'static str> {
         }
     }
     lines.push(format_u64_line("  Usable RAM: ", usable, " bytes"));
-    lines.push(format_u64_line("  Kernel heap: ", memory::HEAP_SIZE as u64, " bytes"));
+    lines.push(format_u64_line(
+        "  Kernel heap: ",
+        memory::HEAP_SIZE as u64,
+        " bytes",
+    ));
     lines.push(String::from(""));
 
     lines.push(String::from("[ Tasks ]"));

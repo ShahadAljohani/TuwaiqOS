@@ -124,11 +124,7 @@ fn write_words(buffer: &[u8; 512]) {
     unsafe {
         for chunk in buffer.chunks(2) {
             let low = chunk[0] as u16;
-            let high = if chunk.len() > 1 {
-                chunk[1] as u16
-            } else {
-                0
-            };
+            let high = if chunk.len() > 1 { chunk[1] as u16 } else { 0 };
             outw(ATA_DATA, low | (high << 8));
         }
     }

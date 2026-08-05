@@ -21,8 +21,14 @@ struct FileSystem {
 static mut FS: Option<FileSystem> = None;
 
 pub fn init() {
-    let mounted = tuwaiqfs::mount().unwrap_or_else(|_| tuwaiqfs::FsNode::Dir {
-        children: Vec::new(),
+    let mounted = tuwaiqfs::mount().unwrap_or_else(|reason| {
+        crate::serial_println!(
+            "fs: mount failed ({}), falling back to an empty filesystem",
+            reason
+        );
+        tuwaiqfs::FsNode::Dir {
+            children: Vec::new(),
+        }
     });
 
     let root = match mounted {
@@ -135,9 +141,12 @@ impl FileSystem {
         if children.iter().any(|(n, _)| n == name) {
             return Err("file or directory already exists");
         }
-        children.push((String::from(name), Entry::File {
-            content: String::new(),
-        }));
+        children.push((
+            String::from(name),
+            Entry::File {
+                content: String::new(),
+            },
+        ));
         self.persist()
     }
 
@@ -147,9 +156,12 @@ impl FileSystem {
         if children.iter().any(|(n, _)| n == name) {
             return Err("file or directory already exists");
         }
-        children.push((String::from(name), Entry::Dir {
-            children: Vec::new(),
-        }));
+        children.push((
+            String::from(name),
+            Entry::Dir {
+                children: Vec::new(),
+            },
+        ));
         self.persist()
     }
 
@@ -199,9 +211,12 @@ impl FileSystem {
                 Entry::Dir { .. } => Err("is a directory"),
             };
         }
-        children.push((String::from(name), Entry::File {
-            content: String::from(text),
-        }));
+        children.push((
+            String::from(name),
+            Entry::File {
+                content: String::from(text),
+            },
+        ));
         self.persist()
     }
 
@@ -229,9 +244,12 @@ impl FileSystem {
                 Entry::Dir { .. } => Err("is a directory"),
             };
         }
-        children.push((file_name, Entry::File {
-            content: String::from(text),
-        }));
+        children.push((
+            file_name,
+            Entry::File {
+                content: String::from(text),
+            },
+        ));
         self.persist()
     }
 
@@ -259,7 +277,10 @@ impl FileSystem {
         }
     }
 
-    fn children_at_mut(&mut self, path: &[String]) -> Result<&mut Vec<(String, Entry)>, &'static str> {
+    fn children_at_mut(
+        &mut self,
+        path: &[String],
+    ) -> Result<&mut Vec<(String, Entry)>, &'static str> {
         let mut node = &mut self.root;
         for part in path {
             node = find_child_mut(node, part)?;
@@ -295,9 +316,12 @@ fn ensure_dir_chain(root: &mut Entry, path: &[String]) -> Result<(), &'static st
         match node {
             Entry::Dir { children } => {
                 if !children.iter().any(|(n, _)| n == part) {
-                    children.push((part.clone(), Entry::Dir {
-                        children: Vec::new(),
-                    }));
+                    children.push((
+                        part.clone(),
+                        Entry::Dir {
+                            children: Vec::new(),
+                        },
+                    ));
                 }
                 let index = children.iter().position(|(n, _)| n == part).unwrap();
                 node = &mut children[index].1;

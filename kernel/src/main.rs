@@ -2,16 +2,22 @@
 
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
+#[macro_use]
+mod serial;
+
 mod ai_bridge;
-mod apps;
 mod allocator;
+mod apps;
 mod ata;
 mod font8x8;
 mod framebuffer_console;
 mod fs;
+mod gdt;
+mod interrupts;
 mod keyboard;
 mod loader;
 mod memory;
@@ -30,7 +36,16 @@ use shell::ConsoleMode;
 entry_point!(kernel_main);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    serial_println!("TuwaiqOS v0.5 kernel_main: booting");
+
     memory::init_heap(boot_info);
+    serial_println!("heap: {} bytes online", memory::HEAP_SIZE);
+
+    // Must come after the heap (the keyboard event queue allocates) and
+    // before anything relies on real interrupts, real ticks, or
+    // interrupt-driven keyboard input.
+    interrupts::init();
+
     ata::init();
     fs::init();
     task::init();
@@ -63,10 +78,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    framebuffer_console::println("");
-    framebuffer_console::println("KERNEL PANIC");
-    vga_buffer::println("");
-    vga_buffer::println("KERNEL PANIC");
-    loop {}
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Serial gets the full message + source location, unconditionally --
+    // it's port I/O, not memory-mapped, so it's safe from any fault
+    // context. The framebuffer console is only touched if confirmed
+    // initialized: this boot configuration's page tables do not map the
+    // legacy VGA text buffer (0xB8000) at all, so the old unconditional
+    // vga_buffer write here would turn a panic into a recursive
+    // page-fault storm instead of a clean halt (see interrupts::report_fault
+    // for the full story).
+    serial_println!("\n=== KERNEL PANIC ===\n{}\n=====================", info);
+    if framebuffer_console::is_active() {
+        framebuffer_console::println("");
+        framebuffer_console::println("KERNEL PANIC");
+    }
+    loop {
+        x86_64::instructions::hlt();
+    }
 }

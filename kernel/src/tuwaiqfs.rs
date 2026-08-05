@@ -11,6 +11,25 @@
 //!
 //! v2 stores the **entire directory tree** (nested paths included) in the
 //! metadata region so files, directories, and metadata survive reboot.
+//!
+//! ## Metadata length tracking (Phase 1 bugfix)
+//!
+//! Earlier builds inferred where the metadata blob ended by scanning for a
+//! zero byte followed by nothing but zero padding. That heuristic silently
+//! corrupted every reboot: a serialized record's own `content_len` field is
+//! a little-endian `u16`, so any file under 256 bytes produces a zero byte
+//! (the length's high byte) immediately followed by real, non-zero content
+//! -- indistinguishable, under the old heuristic, from "data ends here, the
+//! rest is padding". The scan then fell back to treating the *entire*
+//! 512-byte sector as data, the deserializer choked on the trailing zero
+//! bytes it misread as more records, and `fs::init()`'s error fallback
+//! silently substituted an empty filesystem. Every reboot looked like data
+//! loss because, functionally, it was: this is what actually caused
+//! `write hello.txt hello` + `reboot` + `cat hello.txt` to fail before this
+//! fix, despite being the project's own documented validation example.
+//!
+//! The fix stores the real blob length explicitly in the superblock
+//! instead of inferring it, so no scan or heuristic is needed at all.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -27,6 +46,9 @@ pub const VERSION: u32 = 2;
 const MAGIC: [u8; 8] = *b"TQFSv2\0\0";
 const TREE_MAGIC: [u8; 4] = *b"TREE";
 
+/// Superblock field offsets (all little-endian).
+const SB_METADATA_LEN_OFFSET: usize = 20;
+
 /// Serialized node loaded from or written to disk.
 pub enum FsNode {
     File { content: String },
@@ -39,18 +61,26 @@ pub fn mount() -> Result<FsNode, &'static str> {
     ata::read_sector(SUPERBLOCK_LBA, &mut superblock)?;
 
     if superblock[..8] != MAGIC {
+        crate::serial_println!("tuwaiqfs: no valid superblock found, formatting region");
         format_region()?;
+        return Ok(empty_root());
     }
 
-    load_tree()
+    let metadata_len = read_metadata_len(&superblock);
+    crate::serial_println!(
+        "tuwaiqfs: mounting existing tree, {} bytes of metadata",
+        metadata_len
+    );
+    load_tree(metadata_len)
+}
+
+fn read_metadata_len(superblock: &[u8; 512]) -> usize {
+    let bytes = &superblock[SB_METADATA_LEN_OFFSET..SB_METADATA_LEN_OFFSET + 4];
+    u32::from_le_bytes(bytes.try_into().unwrap()) as usize
 }
 
 fn format_region() -> Result<(), &'static str> {
-    let mut superblock = [0u8; 512];
-    superblock[..8].copy_from_slice(&MAGIC);
-    superblock[8..12].copy_from_slice(&VERSION.to_le_bytes());
-    superblock[12..16].copy_from_slice(&METADATA_LBA.to_le_bytes());
-    superblock[16..20].copy_from_slice(&METADATA_SECTORS.to_le_bytes());
+    let superblock = build_superblock(0);
     ata::write_sector(SUPERBLOCK_LBA, &superblock)?;
 
     let empty = [0u8; 512];
@@ -60,22 +90,39 @@ fn format_region() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn build_superblock(metadata_len: u32) -> [u8; 512] {
+    let mut superblock = [0u8; 512];
+    superblock[..8].copy_from_slice(&MAGIC);
+    superblock[8..12].copy_from_slice(&VERSION.to_le_bytes());
+    superblock[12..16].copy_from_slice(&METADATA_LBA.to_le_bytes());
+    superblock[16..20].copy_from_slice(&METADATA_SECTORS.to_le_bytes());
+    superblock[SB_METADATA_LEN_OFFSET..SB_METADATA_LEN_OFFSET + 4]
+        .copy_from_slice(&metadata_len.to_le_bytes());
+    superblock
+}
+
 /// Persist the full filesystem tree to disk.
 pub fn sync_tree(root: &FsNode) -> Result<(), &'static str> {
     let blob = serialize_tree(root)?;
     if blob.len() > MAX_METADATA_BYTES {
         return Err("filesystem metadata too large");
     }
-    write_metadata(&blob)
+    write_metadata(&blob)?;
+
+    // The superblock's recorded length is what makes the next mount able to
+    // read back exactly `blob.len()` bytes without guessing -- see the
+    // module doc comment for why guessing was actively wrong.
+    let superblock = build_superblock(blob.len() as u32);
+    ata::write_sector(SUPERBLOCK_LBA, &superblock)
 }
 
-fn load_tree() -> Result<FsNode, &'static str> {
-    let blob = read_metadata()?;
-    if blob.len() < 8 {
+fn load_tree(metadata_len: usize) -> Result<FsNode, &'static str> {
+    if metadata_len == 0 {
         return Ok(empty_root());
     }
-    if &blob[..4] != TREE_MAGIC {
-        return Ok(empty_root());
+    let blob = read_metadata(metadata_len)?;
+    if blob.len() < 4 || blob[..4] != TREE_MAGIC {
+        return Err("corrupt TuwaiqFS metadata: bad TREE magic");
     }
     deserialize_tree(&blob[4..])
 }
@@ -217,9 +264,12 @@ fn insert_at_path(root: &mut FsNode, path: &str, node: FsNode) -> Result<(), &'s
                 }
 
                 if !children.iter().any(|(n, _)| n == part) {
-                    children.push((String::from(*part), FsNode::Dir {
-                        children: Vec::new(),
-                    }));
+                    children.push((
+                        String::from(*part),
+                        FsNode::Dir {
+                            children: Vec::new(),
+                        },
+                    ));
                 }
                 let pos = children.iter().position(|(n, _)| n == part).unwrap();
                 current = &mut children[pos].1;
@@ -230,35 +280,24 @@ fn insert_at_path(root: &mut FsNode, path: &str, node: FsNode) -> Result<(), &'s
     Ok(())
 }
 
-fn read_metadata() -> Result<Vec<u8>, &'static str> {
-    let mut blob = Vec::new();
+/// Read exactly `len` bytes of metadata back from disk. `len` comes from
+/// the superblock (see `sync_tree`), so no scanning or end-of-data
+/// guessing is needed -- every byte read is known to be real data.
+fn read_metadata(len: usize) -> Result<Vec<u8>, &'static str> {
+    let len = len.min(MAX_METADATA_BYTES);
+    let mut blob = Vec::with_capacity(len);
     let mut sector_buf = [0u8; 512];
 
-    for sector in METADATA_LBA..METADATA_LBA + METADATA_SECTORS {
+    let mut sector = METADATA_LBA;
+    while blob.len() < len {
         ata::read_sector(sector, &mut sector_buf)?;
-        if blob.len() + 512 > MAX_METADATA_BYTES {
-            break;
-        }
-        let end = find_metadata_end(&sector_buf);
-        blob.extend_from_slice(&sector_buf[..end]);
-        if end < 512 {
-            break;
-        }
+        let remaining = len - blob.len();
+        let take = remaining.min(512);
+        blob.extend_from_slice(&sector_buf[..take]);
+        sector += 1;
     }
 
     Ok(blob)
-}
-
-fn find_metadata_end(sector: &[u8; 512]) -> usize {
-    if sector.iter().all(|&b| b == 0) {
-        return 0;
-    }
-    if let Some(pos) = sector.iter().position(|&b| b == 0) {
-        if sector[pos..].iter().all(|&b| b == 0) {
-            return pos;
-        }
-    }
-    512
 }
 
 fn write_metadata(blob: &[u8]) -> Result<(), &'static str> {
