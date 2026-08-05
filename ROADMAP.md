@@ -17,9 +17,13 @@
 
 - [x] Real interrupt architecture: GDT/TSS, IDT with exception handlers,
       PIC remap, PIT timer tick, interrupt-driven keyboard, real `uptime`
+- [x] Physical frame allocator + paging: real physical memory access,
+      `OffsetPageTable`, a heap backed by mapped pages instead of a static
+      array, memory diagnostics in `sysinfo`/`monitor`
 - [ ] Preemptive scheduler with context switching (timer tick exists; task
       switching itself does not yet)
-- [ ] Physical frame allocator + paging
+- [ ] Per-process address spaces / user-mode memory isolation (frame
+      allocator and mapper exist; nothing uses them for process isolation yet)
 - [ ] ELF program loader
 - [ ] Real NIC driver (e1000 / virtio-net)
 - [ ] AI Bridge HTTP client wired to gateway

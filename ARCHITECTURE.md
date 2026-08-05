@@ -148,12 +148,51 @@ See [docs/TUWAIQFS.md](docs/TUWAIQFS.md). The full directory tree is flattened t
 
 - Stack: kernel stack provided by bootloader, plus two dedicated IST
   stacks (double fault, hardware IRQs) installed via the TSS
-- Heap: static 1 MiB buffer in `.bss` — avoids unmapped physical pointer bugs
-- No paging yet (planned for Phase 2); the bootloader's own page tables are
-  used as-is. Notably, they do **not** map the legacy VGA text buffer
-  (0xB8000) in this project's boot configuration -- writing to it from a
-  fault/panic path will page-fault, which is why fault reporting only
-  touches the framebuffer console (see `interrupts::report_fault`)
+- Heap: 4 MiB of real virtual memory at a fixed address (`0x_4444_4444_0000`),
+  backed by physical frames mapped in on demand -- not a static array
+  anymore (see Paging below). Falls back to an equivalent-size static
+  array if the bootloader ever fails to provide a physical memory offset,
+  so a paging setup problem degrades the heap rather than failing to boot.
+- The bootloader's own page tables do **not** map the legacy VGA text
+  buffer (0xB8000) in this project's boot configuration -- writing to it
+  from a fault/panic path will page-fault, which is why fault reporting
+  only touches the framebuffer console (see `interrupts::report_fault`)
+
+## Paging (Phase 2)
+
+- **Physical memory access**: `main.rs` opts into the bootloader mapping
+  *all* physical memory at a dynamic virtual offset
+  (`BootloaderConfig.mappings.physical_memory = Some(Mapping::Dynamic)`).
+  Without this, `boot_info.physical_memory_offset` is `None` and no
+  physical address is dereferenceable at all -- this is exactly why v0.5's
+  heap was a static array instead.
+- **Frame allocator** (`paging::BootInfoFrameAllocator`): bump-allocates
+  4 KiB frames from the bootloader's `Usable` memory regions. Freed frames
+  go onto a small pool and are reused before the bump cursor advances --
+  a real allocator with working deallocation, not a stub that only ever
+  hands out memory.
+- **Mapper**: `paging::init` builds an `x86_64::structures::paging::OffsetPageTable`
+  over the CPU's active level-4 table (read from `CR3`, translated to a
+  virtual address via the physical memory offset above).
+  `paging::map_page` wraps `Mapper::map_to` to return a `Result` instead
+  of panicking on failure (out of frames, or the page is already mapped).
+- **Heap**: `memory::init_heap` maps `HEAP_SIZE` worth of pages at
+  `HEAP_START` with `PRESENT | WRITABLE`, then hands that range to the
+  same `linked_list_allocator` as before -- `allocator.rs`'s public API
+  didn't need to change, only what `init_heap` passes it did.
+- **Diagnostics**: `sysinfo` and `monitor` show heap used/free bytes
+  (`allocator::used()`/`free()`) and frame allocator stats
+  (`paging::frame_stats()`) -- real numbers read from the live allocator
+  state, not placeholders.
+- **Global state**: the installed mapper and frame allocator live behind
+  `spin::Mutex`, not a bare `static mut` -- Phase 3's scheduler is what
+  will make them genuinely reachable from more than one execution context,
+  and this is deliberately already safe for that before it exists.
+- **Still missing** (tracked for later phases): per-process address
+  spaces, unmapping/guard pages for anything other than the heap, and
+  swapping/paging to disk. This phase gives the kernel real physical
+  memory management and a heap that uses it -- it does not yet give
+  user-mode processes isolated memory (Phase 4).
 
 ## Networking
 

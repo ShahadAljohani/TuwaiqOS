@@ -5,9 +5,11 @@ use alloc::vec::Vec;
 
 use bootloader_api::{info::MemoryRegionKind, BootInfo};
 
+use crate::allocator;
 use crate::fs;
 use crate::memory;
 use crate::net;
+use crate::paging;
 use crate::task;
 
 /// Collect monitor output lines.
@@ -29,6 +31,35 @@ pub fn snapshot(boot_info: &BootInfo) -> Result<Vec<String>, &'static str> {
         memory::HEAP_SIZE as u64,
         " bytes",
     ));
+    lines.push(format_u64_line(
+        "    used: ",
+        allocator::used() as u64,
+        " bytes",
+    ));
+    lines.push(format_u64_line(
+        "    free: ",
+        allocator::free() as u64,
+        " bytes",
+    ));
+    if paging::is_active() {
+        lines.push(String::from("  Paging: active (heap is real mapped pages)"));
+        if let Some(stats) = paging::frame_stats() {
+            lines.push(format_u64_line(
+                "    physical frames allocated: ",
+                stats.allocated as u64,
+                "",
+            ));
+            lines.push(format_u64_line(
+                "    physical frames in free pool: ",
+                stats.free_in_pool as u64,
+                "",
+            ));
+        }
+    } else {
+        lines.push(String::from(
+            "  Paging: inactive (heap fell back to a static array)",
+        ));
+    }
     lines.push(String::from(""));
 
     lines.push(String::from("[ Tasks ]"));

@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use bootloader_api::{info::MemoryRegionKind, BootInfo};
 
 use crate::ai_bridge;
+use crate::allocator;
 use crate::apps::{editor, monitor, notes};
 use crate::fs;
 use crate::interrupts;
@@ -16,6 +17,7 @@ use crate::keyboard::{poll_key, KeyEvent};
 use crate::loader;
 use crate::memory;
 use crate::net;
+use crate::paging;
 use crate::reboot;
 use crate::task;
 
@@ -660,7 +662,25 @@ fn print_sysinfo(boot_info: &BootInfo, mode: ConsoleMode) {
     println(mode, " bytes");
     print(mode, "  Kernel heap: ");
     print_u64(mode, memory::HEAP_SIZE as u64);
-    println(mode, " bytes");
+    print(mode, " bytes (");
+    print_u64(mode, allocator::used() as u64);
+    print(mode, " used, ");
+    print_u64(mode, allocator::free() as u64);
+    println(mode, " free)");
+    print(mode, "  Paging: ");
+    if paging::is_active() {
+        print(mode, "active");
+        if let Some(stats) = paging::frame_stats() {
+            print(mode, " (");
+            print_u64(mode, stats.allocated as u64);
+            print(mode, " frames allocated, ");
+            print_u64(mode, stats.free_in_pool as u64);
+            print(mode, " in free pool)");
+        }
+        println(mode, "");
+    } else {
+        println(mode, "inactive (static-array heap fallback)");
+    }
     print(mode, "  Filesystem: ");
     println(mode, fs::label());
     println(mode, "  Tasks: cooperative scheduler");

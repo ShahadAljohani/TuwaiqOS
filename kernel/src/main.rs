@@ -22,6 +22,7 @@ mod keyboard;
 mod loader;
 mod memory;
 mod net;
+mod paging;
 mod programs;
 mod reboot;
 mod shell;
@@ -29,17 +30,36 @@ mod task;
 mod tuwaiqfs;
 mod vga_buffer;
 
+use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::{entry_point, BootInfo};
 
 use shell::ConsoleMode;
 
-entry_point!(kernel_main);
+/// The default config leaves `physical_memory_offset` unset (`None`), which
+/// means the bootloader's own page tables -- and therefore any physical
+/// address at all -- are inaccessible to the kernel. Phase 2's frame
+/// allocator and page-table walking both need to translate physical
+/// addresses to something dereferenceable, so the whole of physical memory
+/// is mapped at a bootloader-chosen (`Dynamic`) virtual offset instead.
+static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
+
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("TuwaiqOS v0.5 kernel_main: booting");
 
-    memory::init_heap(boot_info);
-    serial_println!("heap: {} bytes online", memory::HEAP_SIZE);
+    memory::init_heap(
+        boot_info.physical_memory_offset.into_option(),
+        &boot_info.memory_regions,
+    );
+    serial_println!(
+        "heap: {} bytes online (paged, not a static array)",
+        memory::HEAP_SIZE
+    );
 
     // Must come after the heap (the keyboard event queue allocates) and
     // before anything relies on real interrupts, real ticks, or

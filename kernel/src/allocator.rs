@@ -31,3 +31,13 @@ pub fn init(start: usize, size: usize) {
 pub fn is_initialized() -> bool {
     INITIALIZED.load(Ordering::SeqCst)
 }
+
+/// Bytes currently allocated out of the heap.
+pub fn used() -> usize {
+    HEAP.lock().used()
+}
+
+/// Bytes still available in the heap.
+pub fn free() -> usize {
+    HEAP.lock().free()
+}
