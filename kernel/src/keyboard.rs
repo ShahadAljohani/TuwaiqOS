@@ -43,6 +43,25 @@ lazy_static! {
         Mutex::new(VecDeque::with_capacity(QUEUE_CAPACITY));
 }
 
+/// The only sanctioned way to touch `QUEUE`. `push` runs inside the
+/// keyboard ISR (interrupts already disabled by the CPU); `poll_key` runs
+/// in ordinary shell context with interrupts enabled. Without disabling
+/// interrupts here, a keyboard IRQ landing at the exact moment `poll_key`
+/// held this lock would deadlock: `on_scancode`'s own attempt to lock
+/// `QUEUE` inside the ISR would spin forever waiting for a lock that can
+/// only be released by `poll_key` finishing -- which can't happen until
+/// the ISR itself returns via `iretq`. Same bug class, and same fix, as
+/// `task::with_scheduler` and the interrupt-safe heap allocator.
+fn with_queue<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut VecDeque<KeyEvent>) -> R,
+{
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut guard = QUEUE.lock();
+        f(&mut guard)
+    })
+}
+
 /// Feed one raw scancode byte in from the keyboard ISR. Runs with
 /// interrupts disabled (we're inside the ISR), so this must stay fast and
 /// must never block.
@@ -65,19 +84,20 @@ pub fn on_scancode(scancode: u8) {
 }
 
 fn push(event: KeyEvent) {
-    let mut queue = QUEUE.lock();
-    if queue.len() < QUEUE_CAPACITY {
-        queue.push_back(event);
-    }
-    // Silently drop when full: better to lose an unread keystroke than to
-    // block the ISR or grow the queue unbounded.
+    with_queue(|queue| {
+        if queue.len() < QUEUE_CAPACITY {
+            queue.push_back(event);
+        }
+        // Silently drop when full: better to lose an unread keystroke than
+        // to block the ISR or grow the queue unbounded.
+    });
 }
 
 /// Drain one queued key event. Returns `KeyEvent::None` immediately if
 /// nothing is waiting -- callers that want to idle instead of spin should
 /// call `interrupts::halt()` on `None` (see `shell::run`).
 pub fn poll_key() -> KeyEvent {
-    QUEUE.lock().pop_front().unwrap_or(KeyEvent::None)
+    with_queue(|queue| queue.pop_front()).unwrap_or(KeyEvent::None)
 }
 
 fn translate_extended(scancode: u8) -> Option<KeyEvent> {

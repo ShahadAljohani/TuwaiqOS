@@ -244,6 +244,63 @@ execution state, not bookkeeping strings.
   just relabels it -- is the verification this phase's own engineering
   rules require before it counts as done, not just a clean compile.
 
+## Locking invariant
+
+Introducing real preemption in Phase 3 turned every lock the kernel takes
+into a potential deadlock site, and two independent-review passes each
+found a real instance before this invariant was made explicit and
+enforced everywhere. Both are worth understanding together, because they
+are the same underlying mistake made twice:
+
+**The invariant: any lock that could be held by code the timer interrupt
+might preempt must be held with interrupts disabled for its *entire*
+critical section -- acquisition through release, no exceptions.** On a
+single-core kernel this is exactly sufficient: "interrupts disabled"
+*is* "cannot be preempted", so a task can never be switched away from
+mid-critical-section, which means no other task can ever observe that
+lock as held-by-someone-who-isn't-running-and-never-will-be-again.
+
+- **Bug 1 -- `SCHEDULER` itself.** `task::init`/`spawn`/`list`/`info`/`kill`
+  originally called `SCHEDULER.lock()` directly, with interrupts enabled.
+  The timer ISR's `on_timer_tick` also locks `SCHEDULER`. A tick landing
+  while any of those five held the lock deadlocked permanently. Fixed by
+  `task::with_scheduler`, the single sanctioned access point -- every
+  caller goes through it, so a future call site cannot reintroduce this
+  by forgetting to wrap a lock acquisition by hand.
+- **Bug 2 -- the heap allocator, reachable *through* the first fix.**
+  Making `with_scheduler` interrupt-safe doesn't help if code running
+  *inside* it can still be preempted some other way -- and it can:
+  `list`/`info` clone `String`s and `spawn` pushes to a `Vec`, all of
+  which allocate, and `linked_list_allocator::LockedHeap` (behind
+  `#[global_allocator]`) used a plain, interrupt-oblivious spinlock. A
+  task holding that lock during perfectly ordinary allocation (which
+  doesn't disable interrupts anywhere else in the kernel either) could
+  be preempted by the timer; if the task switched to then tried to
+  allocate -- entirely possible inside `with_scheduler`'s own already
+  interrupt-disabled section -- it would spin on the heap lock forever,
+  and no timer tick could ever fire to let the true owner resume and
+  release it. Fixed in `allocator.rs`: `InterruptSafeHeap` wraps every
+  acquisition of the heap's lock (allocation, deallocation, `init`,
+  `used`, `free`) in `without_interrupts`, the same
+  `spin_lock_irqsave`-style pattern used elsewhere. This is the general
+  fix -- it protects *any* code that allocates while interrupts happen to
+  be off, not just the scheduler's current three call sites.
+- **Bug 3 -- `keyboard::QUEUE`, found proactively while auditing for the
+  same pattern.** `keyboard::push` (called from the keyboard ISR) and
+  `keyboard::poll_key` (called from the shell in ordinary, interrupt-enabled
+  context) locked the same queue without interrupt protection. A keyboard
+  IRQ landing at the exact instant `poll_key` held the lock would deadlock
+  the same way: `on_scancode`'s own lock attempt inside the ISR spins
+  forever waiting for a release that can only happen once the ISR itself
+  returns via `iretq` -- which can't happen until it stops spinning. Fixed
+  the same way: `keyboard::with_queue` is now the single access point.
+
+`without_interrupts` (from the `x86_64` crate) nests safely -- it only
+disables/restores the flag it personally changed, so `with_scheduler`
+calling into code that also calls `with_queue`, or the interrupt-safe
+allocator, composes correctly without double-disabling or prematurely
+re-enabling anything.
+
 ## Networking
 
 Loopback driver echoes packets in RAM. `ping localhost` validates the stack. HTTP client returns 503 stubs for future AI Bridge integration.
