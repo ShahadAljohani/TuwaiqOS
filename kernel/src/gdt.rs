@@ -12,14 +12,19 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
-/// Dedicated stack for the timer and keyboard IRQs. These are the only two
-/// hardware interrupts enabled in Phase 1 and are never nested inside each
-/// other (the CPU masks IF for the duration of an ISR), so sharing one IST
-/// slot between them is safe. Diagnosed during Phase 1 bring-up: routing
-/// them through whatever stack happened to be current at the interrupt
-/// site (e.g. deep inside `ata::wait_not_busy`'s polling loop) produced a
-/// double fault on the first hardware-triggered tick; a dedicated,
-/// always-valid stack removes that dependency entirely.
+/// Dedicated stack for the keyboard IRQ only (see `interrupts.rs`) -- it
+/// never redirects control flow anywhere, just decodes a scancode and
+/// returns, so a fixed always-valid stack is strictly safer with no
+/// downside.
+///
+/// The timer IRQ deliberately does **not** use this (or any) IST stack as
+/// of Phase 3: `task::on_timer_tick` may perform a real context switch,
+/// and that only works if the interrupt frame the CPU pushes on entry
+/// lands on *the currently running task's own stack* -- an IST stack would
+/// force every timer tick onto the same fixed physical stack regardless of
+/// which task was running, destroying the per-task state a switch needs
+/// to resume that task correctly later. See `task.rs`'s module docs for
+/// the full mechanism.
 pub const IRQ_IST_INDEX: u16 = 1;
 
 const STACK_SIZE: usize = 4096 * 5;

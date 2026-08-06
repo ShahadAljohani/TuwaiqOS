@@ -20,10 +20,14 @@
 - [x] Physical frame allocator + paging: real physical memory access,
       `OffsetPageTable`, a heap backed by mapped pages instead of a static
       array, memory diagnostics in `sysinfo`/`monitor`
-- [ ] Preemptive scheduler with context switching (timer tick exists; task
-      switching itself does not yet)
+- [x] Preemptive scheduler: real per-task stacks and a hand-written
+      context switch, timer-driven preemption (50ms slices), `spawn`/
+      `yield_now`/`sleep_ticks`/`exit`; `ps`/`taskinfo`/`kill` act on real
+      scheduler state. Demonstrated with 3 concurrently-scheduled tasks
+      (shell, idle, a heartbeat task) verified live in QEMU.
 - [ ] Per-process address spaces / user-mode memory isolation (frame
-      allocator and mapper exist; nothing uses them for process isolation yet)
+      allocator, mapper, and a real scheduler all exist now; nothing uses
+      them together for process isolation yet -- that's Phase 4)
 - [ ] ELF program loader
 - [ ] Real NIC driver (e1000 / virtio-net)
 - [ ] AI Bridge HTTP client wired to gateway

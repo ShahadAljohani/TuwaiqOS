@@ -83,13 +83,15 @@ lazy_static! {
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
 
+        // Timer: deliberately no IST stack (see gdt::IRQ_IST_INDEX) -- it
+        // must run on whichever task's stack was interrupted so a context
+        // switch inside it can resume that task correctly later.
+        idt[InterruptIndex::Timer.as_usize()].set_handler_fn(timer_interrupt_handler);
+
         // Safety: IRQ_IST_INDEX names a stack gdt::init() already installed
-        // into the TSS before this IDT is loaded. See gdt::IRQ_IST_INDEX
-        // for why hardware IRQs get a dedicated stack.
+        // into the TSS before this IDT is loaded. Keyboard never redirects
+        // control flow, so a fixed stack is safe (and simpler) for it.
         unsafe {
-            idt[InterruptIndex::Timer.as_usize()]
-                .set_handler_fn(timer_interrupt_handler)
-                .set_stack_index(gdt::IRQ_IST_INDEX);
             idt[InterruptIndex::Keyboard.as_usize()]
                 .set_handler_fn(keyboard_interrupt_handler)
                 .set_stack_index(gdt::IRQ_IST_INDEX);
@@ -255,10 +257,19 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     TICKS.fetch_add(1, Ordering::Relaxed);
     // Safety: EOI is only ever issued here, for the interrupt this ISR
     // itself is handling, matching the IRQ this vector is registered for.
+    // Sent before the scheduler runs so the PIC can deliver the next IRQ
+    // regardless of how long a context switch takes.
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
+
+    // May perform a real context switch (see task.rs's module docs) --
+    // this is what makes preemption real rather than cosmetic. Correct
+    // only because this handler does not use an IST stack (see gdt.rs):
+    // it runs on whichever task was interrupted, so a switch here leaves
+    // that task's own suspended state on its own stack.
+    crate::task::on_timer_tick();
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {

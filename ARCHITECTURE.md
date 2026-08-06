@@ -32,7 +32,7 @@ flowchart LR
         ATA[ATA PIO driver]
     end
     subgraph Runtime
-        TASK[Task table]
+        TASK[Scheduler: real TCBs + context switch]
         LD[Program loader]
         APPS[notes / editor / monitor]
     end
@@ -83,7 +83,8 @@ interrupts live rather than a purely polled CPU.
 | `serial.rs` | COM1 UART -- boot log and panic diagnostics, works headless |
 | `gdt.rs` | GDT, TSS, dedicated IST stacks for double-fault and hardware IRQs |
 | `interrupts.rs` | IDT, exception handlers, PIC remap/mask, PIT tick, `uptime` |
-| `memory.rs` / `allocator.rs` | 1 MiB static heap, `GlobalAlloc` |
+| `memory.rs` / `allocator.rs` | 4 MiB paged heap, `GlobalAlloc` |
+| `paging.rs` | Frame allocator, `OffsetPageTable`, error-returning page mapping |
 | `keyboard.rs` | Interrupt-driven PS/2 Set-1 scancodes, Shift, arrows, Tab |
 | `framebuffer_console.rs` | Scaled 8×8 font on bootloader FB |
 | `vga_buffer.rs` | 80×25 text mode fallback |
@@ -91,7 +92,7 @@ interrupts live rather than a purely polled CPU.
 | `fs.rs` | In-memory tree API for shell |
 | `tuwaiqfs.rs` | On-disk serialization (TuwaiqFS v2) |
 | `ata.rs` | Primary master PIO sector I/O |
-| `task.rs` | Cooperative task table |
+| `task.rs` | Preemptive scheduler: real TCBs, per-task stacks, context switch |
 | `loader.rs` / `programs/` | Built-in program registry |
 | `apps/` | notes, editor, monitor |
 | `net/` | Driver trait, loopback, HTTP stub |
@@ -193,6 +194,49 @@ See [docs/TUWAIQFS.md](docs/TUWAIQFS.md). The full directory tree is flattened t
   swapping/paging to disk. This phase gives the kernel real physical
   memory management and a heap that uses it -- it does not yet give
   user-mode processes isolated memory (Phase 4).
+
+## Scheduler (Phase 3)
+
+`task.rs` replaces the old two-row decorative task table with a real
+preemptive scheduler: `ps`/`taskinfo`/`kill` now report and act on genuine
+execution state, not bookkeeping strings.
+
+- **Task control block**: each task has its own heap-allocated 32 KiB
+  stack (the boot task, id 1 "shell", is the one exception -- it runs on
+  the stack the bootloader handed the kernel), a saved stack pointer, and
+  a `Ready`/`Running`/`Blocked`/`Terminated` state.
+- **Context switch**: `context_switch(old_rsp, new_rsp)` is hand-written
+  assembly that looks like an ordinary `extern "C"` call from the Rust
+  side, and that's the whole trick -- the System V calling convention
+  already specifies that a normal call must preserve `rbx`/`rbp`/`r12`-`r15`
+  and the stack pointer, and may clobber everything else (there are no
+  callee-saved XMM registers in SysV at all). Saving exactly that set
+  before switching `rsp` to a different task's stack, then restoring it
+  and `ret`-ing, is a fully correct function call from the compiler's
+  point of view; the "magic" is entirely in whose stack the `ret` address
+  came from. See `task.rs`'s module docs for the complete walkthrough.
+- **Why the timer interrupt no longer uses an IST stack**: a suspended
+  task's entire call chain -- including the CPU-pushed interrupt frame --
+  has to sit dormant on *that task's own stack* between switches, or
+  there's nothing correct to resume later. An IST stack would force every
+  timer tick onto the same fixed physical stack regardless of which task
+  was running, destroying that. Keyboard keeps its IST stack: it never
+  redirects control flow, so this doesn't apply to it.
+- **Preemption**: `task::on_timer_tick` (called from the timer ISR) wakes
+  any `Blocked` task whose sleep has elapsed, then preempts into the
+  scheduler every 5 ticks (50 ms at the PIT's 100 Hz rate).
+- **Primitives**: `spawn`, `yield_now` (also a shell command, `yield`),
+  `sleep_ticks`, `exit`. A fresh task's first-ever entry runs through a
+  small trampoline that explicitly re-enables interrupts (`sti`) before
+  calling it -- a *resumed* task's interrupt-enable state is already
+  correct via its own dormant call chain, but a brand new one has no such
+  chain to inherit it from.
+- **Demonstration**: a `heartbeat` task (id 3) is spawned at boot; it
+  sleeps ~1 second and logs a beat count over serial, forever. Watching
+  its count climb steadily in the serial log while the shell stays
+  interactively responsive -- and while `kill 3` genuinely stops it, not
+  just relabels it -- is the verification this phase's own engineering
+  rules require before it counts as done, not just a clean compile.
 
 ## Networking
 

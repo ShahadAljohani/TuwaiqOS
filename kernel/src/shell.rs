@@ -309,6 +309,10 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "ps" => handle_ps(mode),
         "taskinfo" => handle_taskinfo(mode, args),
         "kill" => handle_kill(mode, args),
+        "yield" => {
+            task::yield_now();
+            println(mode, "Yielded one time slice.");
+        }
         "net" => handle_net_command(mode, args),
         "ping" => handle_ping(mode, args),
         "run" => handle_run(mode, args),
@@ -629,7 +633,7 @@ fn print_help(mode: ConsoleMode) {
     println(mode, "  uptime | reboot | clear | cls | echo <text>");
     println(mode, "  meminfo | memtest");
     println(mode, "  ls | pwd | touch | mkdir | cat | write");
-    println(mode, "  ps | taskinfo | kill | net status | ping");
+    println(mode, "  ps | taskinfo | kill | yield | net status | ping");
     println(mode, "  run <program> | notes | editor");
     println(mode, "  ai | ai status | ask <question>");
     println(mode, "");
@@ -683,7 +687,10 @@ fn print_sysinfo(boot_info: &BootInfo, mode: ConsoleMode) {
     }
     print(mode, "  Filesystem: ");
     println(mode, fs::label());
-    println(mode, "  Tasks: cooperative scheduler");
+    println(
+        mode,
+        "  Tasks: preemptive scheduler (round-robin, 50ms slices)",
+    );
     println(mode, "  Network: loopback");
     println(mode, "  AI Bridge: offline (stub)");
     if let Some(fb) = boot_info.framebuffer.as_ref() {
@@ -702,7 +709,7 @@ fn command_names() -> &'static [&'static str] {
     &[
         "help", "about", "version", "banner", "sysinfo", "monitor", "uptime", "reboot", "clear",
         "cls", "echo", "meminfo", "memtest", "ls", "pwd", "touch", "mkdir", "cat", "write", "ps",
-        "taskinfo", "kill", "net", "ping", "run", "notes", "editor", "ai", "ask",
+        "taskinfo", "kill", "yield", "net", "ping", "run", "notes", "editor", "ai", "ask",
     ]
 }
 
