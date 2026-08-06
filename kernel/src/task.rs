@@ -163,6 +163,33 @@ static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 static NEXT_ID: AtomicU32 = AtomicU32::new(3); // 1 = shell, 2 = idle
 static TICKS_SINCE_SWITCH: AtomicU64 = AtomicU64::new(0);
 
+/// The only sanctioned way to touch `SCHEDULER`. Every call site used to
+/// take `SCHEDULER.lock()` directly; several (`init`, `spawn`, `list`,
+/// `info`, `kill`) did so with interrupts still enabled. On a single-core
+/// kernel that is a real interrupt-reentrancy deadlock, not a theoretical
+/// one: `on_timer_tick` (called from the timer ISR -- see
+/// `interrupts::timer_interrupt_handler`) also locks `SCHEDULER`, and
+/// `spin::Mutex` is not reentrant. If the timer fires while, say, `kill`
+/// holds the lock, the ISR spins forever waiting for a lock owned by the
+/// exact context it just interrupted -- which can never run again to
+/// release it, because the CPU is stuck spinning in the ISR instead.
+/// Routing every access through this one function makes that mistake
+/// structurally impossible to reintroduce at a new call site.
+///
+/// Safe to call from interrupt context too: `without_interrupts` only
+/// disables/restores the flag it itself changed, so nesting (this being
+/// called from `on_timer_tick`, which is already running with IF clear)
+/// is a correct no-op rather than a bug.
+fn with_scheduler<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Option<Scheduler>) -> R,
+{
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        f(&mut guard)
+    })
+}
+
 // Safety: `context_switch` only touches the callee-saved registers SysV
 // requires a normal `extern "C"` call to preserve (see the module docs),
 // plus `rsp` itself, which is the whole point. `task_trampoline` is the
@@ -230,7 +257,7 @@ pub fn init() {
     };
     sched.tasks.push(Box::new(shell));
     sched.tasks.push(Box::new(idle));
-    *SCHEDULER.lock() = Some(sched);
+    with_scheduler(|slot| *slot = Some(sched));
 
     // Concrete, observable proof that Phase 3 is real: this task sleeps
     // and logs a heartbeat over serial roughly once a second. Watching its
@@ -294,9 +321,10 @@ fn heartbeat_entry() {
 pub fn spawn(name: &str, entry: fn()) -> u32 {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let tcb = new_tcb(id, name, entry);
-    let mut guard = SCHEDULER.lock();
-    let sched = guard.as_mut().expect("scheduler not initialized");
-    sched.tasks.push(Box::new(tcb));
+    with_scheduler(|slot| {
+        let sched = slot.as_mut().expect("scheduler not initialized");
+        sched.tasks.push(Box::new(tcb));
+    });
     id
 }
 
@@ -305,9 +333,8 @@ pub fn spawn(name: &str, entry: fn()) -> u32 {
 /// the scheduler once a full time slice has passed.
 pub fn on_timer_tick() {
     let now = crate::interrupts::ticks();
-    {
-        let mut guard = SCHEDULER.lock();
-        if let Some(sched) = guard.as_mut() {
+    with_scheduler(|slot| {
+        if let Some(sched) = slot.as_mut() {
             for task in sched.tasks.iter_mut() {
                 if task.state == TaskState::Blocked
                     && task.wake_at_tick != 0
@@ -318,7 +345,7 @@ pub fn on_timer_tick() {
                 }
             }
         }
-    }
+    });
 
     if TICKS_SINCE_SWITCH.fetch_add(1, Ordering::Relaxed) + 1 >= TIME_SLICE_TICKS {
         TICKS_SINCE_SWITCH.store(0, Ordering::Relaxed);
@@ -332,14 +359,15 @@ pub fn on_timer_tick() {
 /// below, where `without_interrupts` prevents a reentrant tick from
 /// corrupting the switch in progress).
 pub fn schedule() {
+    // Note: this wraps strictly more than the `SCHEDULER` lock itself --
+    // `context_switch` below must also run with interrupts continuously
+    // disabled (a timer tick landing mid-switch, while `rsp` points
+    // somewhere between two tasks' stacks, would be a genuine hazard), so
+    // it cannot go through `with_scheduler` alone. `without_interrupts`
+    // nests safely with the one inside `with_scheduler` (see its doc
+    // comment), so this stays correct either way.
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let switch = {
-            let mut guard = SCHEDULER.lock();
-            match guard.as_mut() {
-                Some(sched) => sched.prepare_switch(),
-                None => None,
-            }
-        };
+        let switch = with_scheduler(|slot| slot.as_mut().and_then(Scheduler::prepare_switch));
         if let Some((old_rsp, new_rsp)) = switch {
             // Safety: `old_rsp` points at the currently-running task's own
             // `saved_rsp` field (a stable heap address behind `Box<Tcb>`,
@@ -361,9 +389,8 @@ pub fn yield_now() {
 /// Block the current task until at least `ticks` PIT ticks have passed.
 pub fn sleep_ticks(ticks: u64) {
     let wake_at = crate::interrupts::ticks() + ticks;
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut guard = SCHEDULER.lock();
-        if let Some(sched) = guard.as_mut() {
+    with_scheduler(|slot| {
+        if let Some(sched) = slot.as_mut() {
             let idx = sched.current;
             sched.tasks[idx].state = TaskState::Blocked;
             sched.tasks[idx].wake_at_tick = wake_at;
@@ -376,9 +403,8 @@ pub fn sleep_ticks(ticks: u64) {
 /// switches away from it permanently (a `Terminated` task is never chosen
 /// by `prepare_switch` again).
 pub fn exit() -> ! {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut guard = SCHEDULER.lock();
-        if let Some(sched) = guard.as_mut() {
+    with_scheduler(|slot| {
+        if let Some(sched) = slot.as_mut() {
             let idx = sched.current;
             sched.tasks[idx].state = TaskState::Terminated;
         }
@@ -395,33 +421,35 @@ pub fn exit() -> ! {
 /// List all tasks for the `ps` command -- genuine scheduler state, not a
 /// static table.
 pub fn list() -> Result<Vec<Task>, &'static str> {
-    let guard = SCHEDULER.lock();
-    let sched = guard.as_ref().ok_or("scheduler not initialized")?;
-    Ok(sched
-        .tasks
-        .iter()
-        .map(|t| Task {
-            id: t.id,
-            name: t.name.clone(),
-            state: t.state,
-        })
-        .collect())
+    with_scheduler(|slot| {
+        let sched = slot.as_ref().ok_or("scheduler not initialized")?;
+        Ok(sched
+            .tasks
+            .iter()
+            .map(|t| Task {
+                id: t.id,
+                name: t.name.clone(),
+                state: t.state,
+            })
+            .collect())
+    })
 }
 
 /// Detailed information about one task.
 pub fn info(id: u32) -> Result<Task, &'static str> {
-    let guard = SCHEDULER.lock();
-    let sched = guard.as_ref().ok_or("scheduler not initialized")?;
-    sched
-        .tasks
-        .iter()
-        .find(|t| t.id == id)
-        .map(|t| Task {
-            id: t.id,
-            name: t.name.clone(),
-            state: t.state,
-        })
-        .ok_or("task not found")
+    with_scheduler(|slot| {
+        let sched = slot.as_ref().ok_or("scheduler not initialized")?;
+        sched
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| Task {
+                id: t.id,
+                name: t.name.clone(),
+                state: t.state,
+            })
+            .ok_or("task not found")
+    })
 }
 
 /// Terminate a task by id. The killed task stops being scheduled starting
@@ -432,15 +460,16 @@ pub fn kill(id: u32) -> Result<(), &'static str> {
         return Err("cannot kill shell task");
     }
 
-    let mut guard = SCHEDULER.lock();
-    let sched = guard.as_mut().ok_or("scheduler not initialized")?;
-    match sched.tasks.iter_mut().find(|t| t.id == id) {
-        Some(task) => {
-            task.state = TaskState::Terminated;
-            Ok(())
+    with_scheduler(|slot| {
+        let sched = slot.as_mut().ok_or("scheduler not initialized")?;
+        match sched.tasks.iter_mut().find(|t| t.id == id) {
+            Some(task) => {
+                task.state = TaskState::Terminated;
+                Ok(())
+            }
+            None => Err("task not found"),
         }
-        None => Err("task not found"),
-    }
+    })
 }
 
 pub fn state_label(state: TaskState) -> &'static str {

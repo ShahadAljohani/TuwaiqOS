@@ -81,7 +81,7 @@ interrupts live rather than a purely polled CPU.
 |--------|------|
 | `main.rs` | Entry point, subsystem init order |
 | `serial.rs` | COM1 UART -- boot log and panic diagnostics, works headless |
-| `gdt.rs` | GDT, TSS, dedicated IST stacks for double-fault and hardware IRQs |
+| `gdt.rs` | GDT, TSS, dedicated IST stacks for double-fault and the keyboard IRQ |
 | `interrupts.rs` | IDT, exception handlers, PIC remap/mask, PIT tick, `uptime` |
 | `memory.rs` / `allocator.rs` | 4 MiB paged heap, `GlobalAlloc` |
 | `paging.rs` | Frame allocator, `OffsetPageTable`, error-returning page mapping |
@@ -103,8 +103,12 @@ interrupts live rather than a purely polled CPU.
 
 - **GDT/TSS** (`gdt.rs`): a minimal GDT (null, kernel code, TSS) plus two
   dedicated Interrupt Stack Table entries -- one for `#DF` (double fault),
-  one shared by the timer and keyboard IRQs, so a hardware interrupt never
-  depends on whatever stack happened to be active at the interrupt site.
+  one for the keyboard IRQ, which never redirects control flow so a fixed
+  stack is safe for it. The timer IRQ deliberately does **not** use an IST
+  stack (see Scheduler below): as of Phase 3 it may perform a real context
+  switch, which only works if the interrupt frame lands on *the currently
+  running task's own stack* rather than a fixed physical one shared by
+  every tick regardless of which task was running.
   Loading a new GDT does **not** reload `SS`/`DS`/`ES`/`FS`/`GS` -- the
   bootloader's own (now-stale) selector values are explicitly reloaded to
   null here, which is load-bearing: skipping it produces a GPF on every
@@ -148,7 +152,9 @@ See [docs/TUWAIQFS.md](docs/TUWAIQFS.md). The full directory tree is flattened t
 ## Memory model
 
 - Stack: kernel stack provided by bootloader, plus two dedicated IST
-  stacks (double fault, hardware IRQs) installed via the TSS
+  stacks installed via the TSS (double fault, and the keyboard IRQ only --
+  the timer IRQ deliberately does **not** use IST as of Phase 3; see
+  Scheduler below)
 - Heap: 4 MiB of real virtual memory at a fixed address (`0x_4444_4444_0000`),
   backed by physical frames mapped in on demand -- not a static array
   anymore (see Paging below). Falls back to an equivalent-size static
