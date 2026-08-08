@@ -2,7 +2,10 @@
 
 ## Overview
 
-TuwaiqOS is a monolithic bare-metal kernel written in Rust (`no_std`). All services run in kernel mode today; user-mode separation is planned for v0.7.
+TuwaiqOS is a monolithic bare-metal kernel written in Rust (`no_std`) with
+hardware-isolated Ring 3 ELF processes. Core services remain in the kernel;
+Phase 4 added per-process address spaces and Phase 5 runs the graphical desktop
+as an unprivileged userspace process.
 
 ```mermaid
 flowchart LR
@@ -13,7 +16,7 @@ flowchart LR
     subgraph Interrupts
         GDT[GDT / TSS]
         IDT[IDT + exception handlers]
-        PIC[PIC remap, timer+keyboard unmasked]
+        PIC[PIC remap, timer+keyboard+mouse cascade unmasked]
         PIT[PIT timer tick]
         SER[Serial diagnostics]
     end
@@ -33,7 +36,8 @@ flowchart LR
     end
     subgraph Runtime
         TASK[Scheduler: real TCBs + context switch]
-        LD[Program loader]
+        ELF[ELF64 Ring 3 loader]
+        DESK[Tuwaiq Desktop process]
         APPS[notes / editor / monitor]
     end
     subgraph Network
@@ -52,12 +56,12 @@ flowchart LR
     KB --> IDT
     SH --> KB
     SH --> FS
-    SH --> LD
+    SH --> ELF --> DESK
     SH --> APPS
     SH --> TASK
     SH --> NET
     FS --> TQFS --> ATA
-    LD --> APPS
+    SH --> APPS
     NET --> LB
     NET --> HTTP
 ```
@@ -87,6 +91,8 @@ interrupts live rather than a purely polled CPU.
 | `memory.rs` / `allocator.rs` | 4 MiB paged heap, `GlobalAlloc` |
 | `paging.rs` | Frame allocator, `OffsetPageTable`, error-returning page mapping |
 | `keyboard.rs` | Interrupt-driven PS/2 Set-1 scancodes, Shift, arrows, Tab |
+| `mouse.rs` / `input.rs` | Bounded PS/2 mouse driver and exclusive foreground Ring 3 input queue |
+| `display.rs` | Validated, atomic userspace-to-framebuffer presentation |
 | `framebuffer_console.rs` | Scaled 8×8 font on bootloader FB |
 | `vga_buffer.rs` | 80×25 text mode fallback |
 | `shell.rs` | Command loop, history, completion |
@@ -128,8 +134,10 @@ interrupts live rather than a purely polled CPU.
   it's confirmed active) before halting. A software breakpoint self-test
   runs immediately after the IDT loads, before any hardware interrupt is
   permitted to fire.
-- **PIC remap**: legacy IRQs 0-15 are remapped to vectors 32-47. Only
-  IRQ0 (timer) and IRQ1 (keyboard) are left unmasked -- `ChainedPics::initialize()`
+- **PIC remap**: legacy IRQs 0-15 are remapped to vectors 32-47. Boot first
+  unmasks IRQ0 (timer) and IRQ1 (keyboard). After bounded PS/2 mouse
+  initialization succeeds, IRQ2 (slave cascade) and IRQ12 are also unmasked;
+  on absent/error paths they remain masked. `ChainedPics::initialize()`
   preserves whatever mask the BIOS left rather than resetting it, and
   SeaBIOS leaves several lines (IRQ14, the primary ATA/IDE controller,
   among them) unmasked by default. A hardware IRQ landing on any other,
@@ -137,10 +145,10 @@ interrupts live rather than a purely polled CPU.
 - **PIT**: channel 0 programmed for a 100 Hz square-wave interrupt, driving
   a tick counter (`interrupts::ticks()` / `uptime_seconds()`) and letting
   the shell's input loop `hlt` between keystrokes instead of busy-spinning.
-- **Keyboard**: scancodes now arrive via IRQ1 and are decoded inside the
-  ISR into a locked queue; `keyboard::poll_key()` keeps its original
-  signature (drain-or-`None`), so `shell.rs` needed no changes beyond
-  halting instead of spinning on `None`.
+- **Keyboard**: scancodes arrive via IRQ1 and are decoded inside the ISR.
+  `keyboard::poll_key()` retains the shell-facing drain-or-`None` API, while
+  Phase 5 routes each decoded event exclusively to either that queue or the
+  foreground Ring 3 input queue.
 
 ## TuwaiqFS v2
 
@@ -207,11 +215,9 @@ See [docs/TUWAIQFS.md](docs/TUWAIQFS.md). The full directory tree is flattened t
   `spin::Mutex`, not a bare `static mut` -- Phase 3's scheduler is what
   will make them genuinely reachable from more than one execution context,
   and this is deliberately already safe for that before it exists.
-- **Still missing** (tracked for later phases): per-process address
-  spaces, unmapping/guard pages for anything other than the heap, and
-  swapping/paging to disk. This phase gives the kernel real physical
-  memory management and a heap that uses it -- it does not yet give
-  user-mode processes isolated memory (Phase 4).
+- **Phase boundary**: Phase 2 itself stopped at kernel paging. Phase 4 has
+  since added isolated per-process address spaces, and Phase 5 added anonymous
+  mapping/unmapping. Swapping and paging to disk remain unimplemented.
 
 ## Scheduler (Phase 3)
 
@@ -263,7 +269,8 @@ no address-space isolation, one shared page, one process at a time) with a
 real process model: genuine ELF64 programs, each with its own private
 address space, scheduled and preempted exactly like any kernel task, with a
 real syscall interface and hardware-enforced fault isolation. This section
-documents it as it stands today; the earlier milestone's demo code
+records that foundation and points to Phase 5 where current behavior extends
+it; the earlier milestone's demo code
 (`usermode.rs`'s payloads, the `usermode` shell command) no longer exists --
 see git history for that snapshot if needed.
 
@@ -402,13 +409,10 @@ user process is simply a `Tcb` whose `process` field is `Some`.
   bump cursor only advances when the free list is empty and a genuinely
   new frame has to be handed out, so it's flat if and only if every
   freed frame was actually returned to circulation.
-- **Known leak** (pre-existing, not introduced by Phase 4): a `Tcb` is
-  never removed from the scheduler's task list once `Terminated` -- `kill`
-  and the old Phase 3 code already had this property for kernel tasks. A
-  terminated user process's 32 KiB kernel-stack `Box` therefore also leaks
-  (its *address-space* frames are correctly freed, only the `Tcb`/kernel-stack
-  allocation itself is not). Not a new regression; worth fixing whenever
-  process reaping is added.
+- **Reaping (Phase 5)**: the Phase 4 leak is closed. Terminated TCBs and
+  their 32 KiB kernel stacks are removed after a grace period or explicit
+  reap; automatic and explicit-kill paths are both covered by lifecycle
+  tests.
 
 ### Syscall ABI
 
@@ -422,6 +426,12 @@ generic failure -- no `errno`-style detail channel in this minimal ABI.
 | 1 | WRITE | `ptr: *const u8, len: usize` | bytes written, or `-1` |
 | 2 | YIELD | -- | `0` |
 | 3 | GETPID | -- | this process's task id |
+| 4 | MMAP | `len: usize, writable: bool` | chosen arena address, or `-1` |
+| 5 | MUNMAP | `ptr: *mut u8, len: usize` | `0`, or `-1` |
+| 6 | DISPLAY_INFO | `out_ptr: *mut u8, out_len: usize` | `0`, or `-1` |
+| 7 | DISPLAY_PRESENT | `ptr: *const u8, len: usize` | `0`, or `-1` |
+| 8 | INPUT_POLL | `out_ptr: *mut u8, out_len: usize` | `1`, `0`, or `-1` |
+| 9 | UPTIME_TICKS | -- | 100 Hz tick count |
 
 Any other number: `-1`, logged, the process keeps running (`syscall.rs`
 `dispatch`'s `_` arm) -- unknown syscalls fail safely rather than crashing
@@ -435,14 +445,19 @@ all 15 GPRs (verified 16-byte SysV stack alignment at the `call` into Rust:
 120 bytes of pushes plus the CPU's own 40-byte privilege-change entry
 adjustment lands exactly on a 16-byte boundary), calls into
 `syscall_dispatch`, restores every register (`RAX` now holding the result),
-and `iretq`s back to Ring 3. `int 0x80` is registered as an interrupt gate
-(not a trap gate), so the CPU itself clears `IF` on entry -- the entire
-syscall body runs with interrupts disabled, which is also what makes the
-pointer-validation step below race-free: nothing can preempt a process
-between validating a pointer and using it within the same syscall.
+and `iretq`s back to Ring 3. `int 0x80` is an interrupt gate, so the CPU
+clears `IF` on entry. Short syscalls remain non-preemptible. Large
+MMAP/MUNMAP transactions explicitly enable interrupts only between bounded
+scheduler/paging lock scopes; the current single-threaded process cannot
+execute Ring 3 code during that interval, so its transaction stays race-free
+while PIT preemption and peer tasks continue.
 
-**Pointer validation**: `WRITE` is the only syscall taking a pointer.
-`sys_write` first rejects `len > 4096` outright, then calls
+**Pointer validation**: WRITE, MUNMAP, DISPLAY_INFO, DISPLAY_PRESENT, and
+INPUT_POLL accept Ring 3 addresses. All use fallible canonical-address
+construction, caller-user-region bounds, checked range arithmetic, and a
+complete per-page permission walk (`PRESENT | USER_ACCESSIBLE`, plus
+`WRITABLE` for copy-out) before access. `sys_write` first rejects
+`len > 4096` outright, then calls
 `task::copy_from_current_user`, which walks the *calling* process's own
 page tables (`paging::translate_in_address_space`, then
 `read_bytes_from_address_space`) and only copies bytes once every page in
@@ -507,21 +522,13 @@ hardware-verified evidence, not a heuristic.
 
 ### Known limitations
 
-- Single, fixed 1 GiB user address range shared (disjointly) by every
-  process -- no ASLR, no growth beyond it, no `mmap`-style dynamic mapping.
+- Single, fixed 1 GiB private user range per process; no ASLR or growth
+  beyond it. Phase 5 adds a bounded anonymous mmap arena inside that range.
 - No dynamic linking (`ET_EXEC` only), no relocations, no filesystem-backed
-  executable loading yet (`runelf` loads from six build-time-embedded ELF
-  binaries only).
-- Terminated `Tcb`s (and their kernel-stack allocation) are never reaped --
-  a pre-existing property of `task.rs`, not new to Phase 4 (see above).
-- No dedicated automated test exercises "execute code from a `NO_EXECUTE`
-  page" specifically (EFER.NXE itself *is* verified -- see `paging::enable_nx`
-  -- and every data/stack page is correctly marked `NO_EXECUTE`; only a
-  fault-injection test for that exact case wasn't added this pass, to avoid
-  introducing a hang-prone test into the verification harness under time
-  pressure).
-- Syscall surface is intentionally minimal (4 syscalls) -- no filesystem,
-  no IPC, no memory-mapping syscalls yet.
+  executable loading yet (the current build embeds 19 ELF binaries).
+- The current syscall surface is intentionally minimal at 10 calls: no
+  filesystem or IPC syscalls. Phase 5 adds reaping and dedicated CPU-enforced
+  read-only, NX, and post-unmap fault tests.
 
 ### Verification performed
 
@@ -546,6 +553,393 @@ calls (`spawnfail 25`), confirming the address-space-cleanup fix reclaims
 every frame on every failure path rather than leaking any of them; the
 full Phase 1-3 regression checklist; and TuwaiqFS content surviving a full
 VM reset.
+
+## Phase 5: userland runtime and the first Tuwaiq Desktop
+
+Phase 5 turns the Phase 4 process model into enough of a real userland
+runtime to run a genuine graphical desktop: reclaiming the memory Phase 4
+left leaking, a minimal anonymous-memory ABI, a kernel display abstraction
+with a validated present path, a real PS/2 mouse driver, a unified
+keyboard+mouse input queue, and the Tuwaiq Desktop itself -- a real Ring 3
+ELF64 process with a small userspace window compositor. This is the
+**first** desktop milestone: a background, a system bar, a working cursor,
+one movable/closable window type, and keyboard/mouse interaction that
+visibly reaches userspace -- not a claim that TuwaiqOS is a general-purpose
+desktop OS yet. Kernel policy stays exactly what Phase 4 established
+(mechanism in the kernel, policy in userspace); nothing here weakens that.
+
+### Process lifecycle cleanup (reaping)
+
+Phase 4 documented a known leak: a `Tcb` was never removed from the
+scheduler's task list once `Terminated`, so its 32 KiB kernel-stack `Box`
+(and, after this phase, its `Tcb` slot) accumulated forever across repeated
+process creation. Fixed in `task.rs` with grace-period reaping rather than
+immediate removal:
+
+- `Tcb` gains `terminated_at_tick: u64`, stamped by both `exit_with_code`
+  and `kill` the moment a task becomes `Terminated`.
+- `Scheduler::reap_terminated(force: bool)` removes every `Terminated` task
+  (other than the currently running one -- reaping your own still-executing
+  context is never safe) whose `terminated_at_tick` is at least
+  `REAP_GRACE_TICKS` (500 ticks, 5s at 100 Hz) in the past, or unconditionally
+  when `force` is set. Freeing a reaped process's `AddressSpace` reuses the
+  exact same `paging::free_address_space` path Phase 4's `kill`/`schedule`
+  already used -- no new frame-reclamation logic, just a new caller.
+- Called automatically at the top of every `prepare_switch()` (so reaping
+  is continuous background housekeeping, not something a caller has to
+  remember to invoke) and, for deterministic testing, via `task::reap_now()`
+  (force = true).
+- The grace period exists so `runelf`/`isolate`'s existing
+  `wait_for_terminated` -> `print_process_result` pattern keeps working
+  unchanged: both read a terminated task's final state immediately after it
+  exits, and reaping it out from under that read would turn real exit-code
+  evidence into a "task not found" error. 5 seconds is far longer than any
+  shell command's own read-back takes.
+- `reap <count>` (`shell.rs`) is the measurable proof: spawn/wait `count`
+  `hello` processes back to back (each left `Terminated` but held by the
+  grace period), force-reap everything, and compare both the live task
+  count and the frame allocator's bump cursor before/after. A stable task
+  count proves no leaked `Tcb`s; a stable bump cursor proves every
+  process's address-space frames were genuinely returned to the free pool
+  and reused by the next spawn, not merely freed-and-abandoned.
+
+### User memory ABI (`SYS_MMAP` / `SYS_MUNMAP`)
+
+A minimal, TuwaiqOS-specific anonymous-memory primitive rather than a
+general POSIX `mmap` -- no file backing, no fixed-address requests, no
+protection-flag bitmask, because none of those are needed yet and a
+narrower ABI is easier to keep provably safe.
+
+- **Arena**: `paging::USER_MMAP_BASE = USER_SPACE_BASE + 256 MiB`,
+  `USER_MMAP_LIMIT = USER_SPACE_BASE + USER_SPACE_SIZE - 1 MiB` -- placed
+  well clear of where ELF segments load (bottom of the 1 GiB region,
+  always small in practice) and the user stack (top ~20 KiB), inside the
+  same per-process `USER_REGION_PML4_INDEX` Phase 4 already isolates.
+- **Allocation** (`task::mmap_in_current_process(len, writable)`): a simple
+  bump allocator over `ProcessState::mmap_next`, one process-local field,
+  no shared/global state. `len` is validated (checked page-count rounding,
+  rejects zero and anything above `MAX_MMAP_LEN` = 64 MiB) before any page
+  is touched, and the bump cursor is checked against `USER_MMAP_LIMIT`
+  before mapping anything. Each page is mapped `PRESENT | WRITABLE |
+  USER_ACCESSIBLE` first (so the kernel-side zeroing pass can populate it),
+  zeroed, then narrowed to read-only if the caller didn't ask for
+  `writable` -- `NX` (no-execute) is implicit: mmap'd pages are always data,
+  never marked executable, so a process can never turn a writable buffer
+  into code to run. The full destination is preflighted; mapping, zeroing,
+  and final permissions run in four-page transactions with interrupts enabled
+  between lock scopes. Any failure rolls back mapped leaves, reclaims newly
+  empty P1-P3 tables, verifies the exact pre-call address-space frame count,
+  and leaves `mmap_next` unchanged.
+- **Release** (`task::munmap_in_current_process(ptr, len)`): validates page
+  alignment and that the entire `[ptr, ptr+len)` range falls inside
+  `[USER_MMAP_BASE, mmap_next)` -- i.e., genuinely came from this process's
+  own prior `mmap` calls -- before unmapping anything. The kernel records the
+  complete leaf set before mutation, removes it in bounded batches while
+  retaining ownership, restores earlier batches if any later removal fails,
+  and only then returns leaf frames to the global pool and prunes newly empty
+  P1-P3 tables in bounded ranges. A rejected unmap therefore changes no
+  mapping or allocator ownership. Since the
+  arena is a bump allocator with no free list, a freed range's virtual
+  addresses are not reused by later `mmap` calls in the *same* process --
+  a documented, deliberate simplification, not a leak (the physical frames
+  themselves are fully reclaimed and reused by any process).
+- **Isolation**: `MMAP` does not accept a requested address, so allocation
+  outside the caller's arena is not expressible. `MUNMAP(ptr, len)` does accept
+  an address; it rejects noncanonical, overflowing, unaligned, out-of-arena,
+  unowned, or partially unmapped ranges before changing any leaf.
+- **Security-hardening side effect**: designing `SYS_MMAP` alongside
+  `SYS_DISPLAY_INFO`/`SYS_INPUT_POLL` (the first syscalls to write kernel
+  data into a Ring-3-controlled destination pointer) surfaced a latent gap
+  in `paging::for_each_mapped_chunk`, the helper Phase 4's `WRITE` pointer
+  validation is built on: it checked the destination was `WRITABLE` but not
+  `USER_ACCESSIBLE`. Every Phase 4 caller's destination was always
+  kernel-computed and already `USER_ACCESSIBLE`, so this was never
+  exploitable before Phase 5 -- but a new syscall accepting a raw
+  destination pointer could otherwise have let a process pass a
+  `WRITABLE`-but-supervisor-only kernel address and get the kernel to write
+  into arbitrary kernel memory. Fixed by adding the `USER_ACCESSIBLE` check
+  to the shared helper before any new syscall used it, closing the gap for
+  every current and future caller at once.
+- **Tests**: `bad_mmap`, `bad_munmap`, and `mmap_exhaustion` cover zero/huge
+  lengths, rounding, bounds, zero-fill, write/read, noncanonical/overflowed/
+  partial/double unmaps, exhaustion rejection, exact leaf/page-table rollback,
+  physical-frame reuse, and PIT progress during 64 MiB map/unmap. `mmap_ro_fault`,
+  `mmap_nx_fault`, and `post_unmap_fault` verify CPU permissions.
+
+### Display subsystem
+
+`display.rs` turns the raw framebuffer `framebuffer_console.rs` already
+owned into a controlled interface for Ring 3:
+
+- **`SYS_DISPLAY_INFO`**: writes a fixed 20-byte little-endian record
+  (`width, height, stride, bytes_per_pixel, pixel_format` -- all `u32`;
+  `stride` is in pixels, matching `bootloader_api`'s own field, so a
+  renderer computes a byte offset as `(y * stride + x) * bytes_per_pixel`)
+  into a caller-supplied buffer, through the same `USER_ACCESSIBLE`-checked
+  `task::copy_to_current_user` path `WRITE` uses.
+- **`SYS_DISPLAY_PRESENT`**: the *only* path that ever writes into the real
+  framebuffer on a process's behalf. Userspace never receives a pointer to
+  real framebuffer memory, ever -- it renders into its own `SYS_MMAP`'d
+  buffer and submits the finished frame through this syscall.
+  `display::present` validates, in order, before copying a single byte:
+  a display must actually be active; the caller's buffer length must
+  *exactly* equal the real framebuffer's byte length (not "at least" --
+  exact, so a mismatched buffer is always rejected rather than silently
+  truncated or read out of bounds); every page of the caller's buffer must
+  be mapped `PRESENT | USER_ACCESSIBLE` in the caller's own address space.
+  A full-range preflight completes before the mutable physical framebuffer is
+  borrowed. The caller's CR3 remains active and its one userspace thread
+  cannot change mappings during this non-preemptible syscall; only then does
+  one contiguous copy update the disjoint kernel framebuffer. A bad later page
+  therefore changes zero framebuffer bytes. Avoiding both an intermediate
+  multi-megabyte `Vec` and a redundant second page-table walk keeps the
+  validated full-frame copy below one scheduler quantum in acceptance.
+- **Negative tests** (`bad_display.rs`): kernel, noncanonical, cross-page,
+  unmapped, partially mapped, and wrong-sized buffers are rejected. The shell
+  compares full-framebuffer checksums before/after the hostile process to prove
+  rejected presents are destination-atomic.
+
+### PS/2 mouse driver
+
+`mouse.rs`, IRQ12 (routed through the slave PIC's cascade line, IRQ2 on
+the master -- both must be unmasked, or no slave-PIC interrupt reaches the
+CPU regardless of IRQ12's own mask bit).
+
+- **Bring-up** (`mouse::init`, called from `main.rs` right after
+  `interrupts::init`): the standard 8042 sequence -- enable the auxiliary
+  device (`0xA8`), enable its IRQ and clock in the controller's config byte
+  (`0x20`/`0x60`), then `0xF6` (set defaults) / `0xF4` (enable streaming)
+  sent to the mouse itself via the `0xD4` "next byte to auxiliary device"
+  prefix, with bounded controller waits, ACK/RESEND handling, and a 200 Hz
+  sample rate. Initialization runs with interrupts disabled so IRQ1 cannot
+  consume controller replies. `interrupts::enable_mouse()` unmasks IRQ12 + the IRQ2 cascade
+  line **only after** `mouse::init` has finished programming the device --
+  never the reverse, which could deliver an interrupt to a still-mid-configuration
+  device or a not-yet-ready packet-sync state. The keyboard's IRQ1 line is
+  untouched by any of this (`interrupts::init`'s original mask logic for it
+  is unchanged). If the controller/device is absent or rejects setup, boot
+  continues with IRQ12 masked.
+- **Packet decode** (`mouse::on_byte`, called from the new
+  `mouse_interrupt_handler`): standard 3-byte PS/2 packets, resynchronized
+  on the fly via the packet's own sync bit (byte 0, bit 3, always set) --
+  a byte arriving where a sync bit is expected but absent is dropped rather
+  than assembled into a garbage packet, so a single dropped/extra byte
+  anywhere in the stream self-heals within one packet. Signed X/Y deltas
+  (sign bits in byte 0), overflow-flagged packets discarded outright, Y
+  inverted (PS/2 reports +Y as "up"; screen coordinates grow downward).
+  Position is absolute and clamped to `[0, display::info().width/height)`
+  every update -- a desktop process never has to replicate that
+  bookkeeping or risk drawing a cursor off-screen. Left/right/middle button
+  *edges* (not just presses) are detected by comparing each packet's button
+  bits to the previous packet's, so a release is a real, distinct event.
+
+### Unified input ABI (`input.rs` / `SYS_INPUT_POLL`)
+
+A single bounded queue (`VecDeque`, capacity 64, same
+lock-with-`without_interrupts` pattern as every other ISR-fed queue in this
+kernel -- `keyboard::QUEUE`, `task::SCHEDULER`, `paging`'s global locks)
+merging keyboard and mouse events for Ring 3 consumption:
+
+- **`InputEvent`**: `KeyDown { code }` / `MouseMove { x, y }` /
+  `MouseButton { button, pressed }`, encoded as a fixed 8-byte
+  little-endian record (`SYS_INPUT_POLL`'s consumers never need a
+  variable-length or unbounded buffer). No `KeyUp`: the existing keyboard
+  scancode decoder (`keyboard.rs`) does not track release state for
+  ordinary keys, only internally for Shift -- adding that is future work,
+  not faked here with a synthetic release that never actually corresponds
+  to a real key-up.
+- **Exclusive ownership**: `keyboard.rs` tracks either shell ownership or one
+  foreground process id. A decoded key goes to exactly one queue. Transitions
+  run with interrupts disabled and clear both queues, so desktop keystrokes
+  cannot accumulate and later replay as privileged shell commands. Mouse
+  events enter the Ring 3 queue only while a foreground process owns input.
+- **`SYS_INPUT_POLL(out_ptr, out_len)`**: drains one event if the queue is
+  non-empty (return `1`), returns `0` immediately if empty (not an error --
+  a desktop's main loop polls every frame and is expected to see this
+  constantly, so it stays cheap and non-blocking), `-1` for an undersized
+  or invalid destination buffer. It validates the destination before reading
+  queue state or popping: invalid pointers fail even on an empty queue, and a
+  queued event survives a rejected copy. Only the foreground pid may poll.
+- **Negative tests** (`bad_input.rs`): deterministic seeded-event coverage
+  proves invalid kernel/noncanonical/cross-page destinations do not consume
+  the event; retrying with a valid buffer returns the same encoded `Z` event.
+
+### Tuwaiq Desktop (userspace)
+
+`userland/hello/src/bin/desktop/` -- a real ELF64 Ring 3 process, built and
+loaded through exactly the same `task::spawn_user_process` /
+`shell.rs::embedded_program` path as `hello` and every `bad_*` test binary
+(the `desktop` shell command is a thin wrapper over `runelf`'s own spawn
+logic, no kernel-side special case for this program). `#![no_std]` with no
+`alloc` at all -- every data structure is a fixed-size array, matching this
+process's genuinely allocator-free execution environment.
+
+- **Rendering** (`gfx.rs`): software-only, into a `SYS_MMAP`'d backbuffer
+  sized exactly to `DisplayInfo::buffer_len()` (`stride * height *
+  bytes_per_pixel`, matching what `DISPLAY_PRESENT` requires byte-for-byte).
+  Per-pixel format handling (RGB / BGR / U8 grayscale) mirrors
+  `framebuffer_console.rs`'s own `write_pixel` on the kernel side. An 8x8
+  glyph table (`font.rs`) is duplicated byte-for-byte from
+  `kernel/src/font8x8.rs` (public domain) -- the desktop renders its own
+  text entirely in its own memory; it does not and cannot call back into
+  the kernel's text console.
+- **Window model** (`window.rs`, Milestone 7): intentionally small --
+  fixed-capacity array (`MAX_WINDOWS = 4`), back-to-front z-order,
+  rectangular hit-testing, a title-bar drag region, and a close box. Window
+  *policy* (what happens on a click, how many windows exist, what a window
+  contains) lives entirely here in userspace; the kernel has no concept of
+  a window at all, only a validated pixel buffer and a present syscall.
+- **Main loop** (`main.rs`): poll every queued input event
+  (`SYS_INPUT_POLL`, drained in a loop each frame so a burst of mouse
+  packets between two of this process's time slices never visibly lags the
+  cursor) -> update cursor position / window drag state / the launcher and
+  key-log. It redraws/presents only on first frame, input changes, or a clock
+  tick; idle iterations yield without touching the framebuffer. Escape
+  requests a normal exit after unmapping the backbuffer. Cooperative yielding,
+  not a busy spin, preserves ordinary round-robin fairness.
+- **What's visibly on screen**: a dark background and system bar with a
+  restrained green accent (Tuwaiq identity, not a neon demo effect or a
+  clone of an existing desktop's chrome), "TuwaiqOS" branding, a live
+  HH:MM:SS clock derived from `SYS_UPTIME_TICKS` (100 Hz, the same
+  `interrupts::TIMER_HZ` this kernel has used since Phase 1), a "+ Launch"
+  button that spawns a new movable/closable panel window each click (up to
+  `MAX_WINDOWS`), one panel present from startup, and a rolling log of
+  recently typed printable characters at the bottom of the screen -- the
+  visible proof that keyboard input genuinely reaches this process.
+
+### Security boundaries (Phase 5 additions)
+
+Every new kernel/user boundary follows the same rule Phase 4 established:
+never trust a Ring 3 pointer, argument, or length; validate before touching
+memory; fail with `-1`, never a kernel fault, on anything invalid.
+
+- `SYS_MMAP` chooses an address inside the caller's arena; `SYS_MUNMAP` accepts
+  `ptr,len` but prevalidates canonicality, overflow, alignment, arena bounds,
+  mappings, and ownership for the entire range before mutation.
+- `SYS_DISPLAY_PRESENT` requires an *exact* buffer-length match and a full
+  per-page `PRESENT | USER_ACCESSIBLE` validation of the entire source
+  range before copying anything -- an oversized, undersized, or partially
+  unmapped buffer is rejected outright.
+- Every raw Ring 3 pointer goes through `VirtAddr::try_new`, private-user-range
+  bounds, checked arithmetic, and complete page permission validation.
+  `SYS_DISPLAY_INFO`/`SYS_INPUT_POLL` additionally require writable pages.
+- A process that exits or faults while it owns an `mmap`'d graphics buffer
+  or is mid-`DISPLAY_PRESENT` is handled by the same fault/exit machinery
+  as any other process: its address space (and every frame it owns,
+  buffers included) is reclaimed by the existing reaping/`kill` path; nothing
+  Phase 5 added needs its own separate cleanup path, because ownership of
+  every new resource (mmap'd pages, in particular) lives inside the
+  process's own `AddressSpace`, exactly like its ELF segments and stack
+  always have.
+- Mouse and keyboard IRQs share the same interrupt-safe locking discipline
+  as every other queue in this kernel (see "Locking invariant" below) --
+  a timer interrupt landing mid-`SYS_INPUT_POLL`, or a mouse/keyboard IRQ
+  landing mid-scheduler-operation, cannot deadlock, by the same invariant
+  Bugs 1-4 established and this phase's new locks were audited against
+  before being added, not after.
+
+### Known limitations
+
+- The mmap arena is a pure bump allocator with no free list: a `munmap`'d
+  range's virtual addresses are not reclaimed for reuse within the same
+  process (the underlying physical frames are still fully reclaimed and
+  reused globally). A process that mmaps and munmaps in a tight loop will
+  eventually exhaust the roughly 767 MiB virtual arena even though physical
+  memory pressure never changes. The 64 MiB value is the cap for one MMAP
+  request, not the arena size.
+- No `KeyUp` events -- `keyboard.rs`'s scancode decoder doesn't track
+  per-key release state for ordinary keys yet, so `InputEvent::KeyDown` is
+  the only keyboard event kind.
+- The window model supports exactly one interaction at a time (drag *or*
+  close *or* raise-to-front on a given click) and does not support
+  minimizing, resizing, or overlapping-window-aware redraw optimization --
+  each dirty update still redraws and presents the entire backbuffer rather
+  than tracking dirty rectangles. Idle loop iterations do not redraw.
+  Deliberately small: this is the first window model, not a general compositor.
+- `MAX_WINDOWS = 4`, fixed at compile time, no heap in this process to grow
+  it dynamically.
+- The desktop is still launched from an embedded ELF binary
+  (`shell.rs::embedded_program`), the same mechanism every `runelf` test
+  program already uses -- filesystem-backed executable loading remains
+  future work (tracked since Phase 4, unchanged by this phase).
+- `TIMER_HZ` (100) is duplicated as a documented assumption in the
+  desktop's own clock code rather than exposed via a syscall; if the
+  kernel's timer frequency ever changes, this constant needs updating
+  alongside it.
+
+### Phase 5 Verification Performed
+
+The project-side acceptance path is reproducible and assertion-driven; it does
+not depend on an external scratch directory:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\phase5-acceptance.ps1
+```
+
+The harness refuses the wrong branch or a dirty final candidate, copies and
+hashes the built image, boots 128 MiB QEMU through TCP serial/monitor channels,
+fails on a missing marker/timeout/kernel fault, reboots the same image for
+filesystem persistence, and performs a second `pc,i8042=off` boot for the
+bounded mouse-absent path. Development-only runs may use `-AllowDirty`; a
+development exhaustion skip is explicitly recorded as `SKIP` and
+`DEVELOPMENT-SKIPPED`, never PASS. Concise JSON, serial, manifest, and PPM
+evidence is written under `target/phase5-acceptance/` (ignored build output).
+
+The 2026-08-08 acceptance pass exercised:
+
+- boot, GDT/TSS, breakpoint/exception handling, PIC/PIT at 100 Hz, keyboard,
+  initialized PS/2 mouse/IRQ12, heap, paging, physical-frame reuse, shell, and
+  the built-in loader;
+- real ELF execution, the 10-call syscall ABI, unknown-syscall rejection,
+  distinct PML4s, two preempted Ring 3 processes, and isolated page-fault,
+  privileged-instruction, invalid-opcode, and divide-error recovery;
+- all pointer-bearing syscalls with zero, kernel, noncanonical, unmapped,
+  overflowing, huge, cross-page, cross-user-boundary, partial, read-only, and
+  wrong-length inputs. DISPLAY_PRESENT rejection preserved an exact physical
+  framebuffer checksum; INPUT_POLL preserved a seeded event across invalid
+  destinations and validated invalid pointers while empty;
+- MMAP zero-fill, rounding, bounds, writable/read-only and NX enforcement,
+  exhaustion rejection, injected post-mutation rollback, unchanged-address
+  retry, exact leaf and page-table-frame ownership restoration, MUNMAP
+  full-range atomicity, double/partial rejection, post-unmap CPU fault, frame
+  reclamation, and zero-filled reuse;
+- automatic grace-period reap, explicit kill/reap, failed-spawn rollback, and
+  20 desktop start -> successful first present -> normal Escape exit -> reap
+  cycles. Task count, live frames, frame bump cursor, and kernel heap/stack
+  usage returned to warmed baselines;
+- foreground input isolation by typing `reboot` and `kill 1` into the desktop,
+  exiting, and proving neither command reached the privileged shell;
+- live pointer movement, nonzero-coordinate window drag, focus/z-order, close,
+  launcher, keyboard echo, normal exit/relaunch, a concurrent Ring 3 peer, a
+  faulting peer, forced desktop termination, shell recovery, and heartbeat
+  progress after graphics stress;
+- TuwaiqFS create/write/read, a genuine machine reboot, persisted file content,
+  and a post-reboot Ring 3 launch; plus a mouse-absent boot that kept IRQ12
+  masked and the scheduler alive.
+
+Measured dirty-candidate results before the final clean-commit rerun were:
+
+- mouse queue age improved from the audited 6-tick/60 ms baseline to 1 tick
+  maximum in the live interaction sequence (the gate permits at most 2 ticks),
+  with adjacent move coalescing and zero dropped events;
+- the former 64 MiB VM blackout took 30.942 s with PIT suppressed. Batched VM
+  transactions reduced the full allocation/rejection/unmap/reuse sequence to
+  9.288 s while PIT advanced during both large syscalls. Critical sections
+  averaged 21 milli-ticks (~0.21 ms); the observed QEMU/host tail was 5194
+  milli-ticks (~51.9 ms), under the 100 ms hard gate;
+- after removing the redundant second page-table walk, full-frame present
+  measured 2821 milli-ticks (~28.2 ms) worst case, below one 50 ms scheduler
+  quantum. The desktop avoids presents entirely while idle;
+- the kernel build retained the pre-existing 9 warnings and added zero new
+  warnings. Rust formatting and `git diff --check` are final gates.
+
+Security invariants retained by these tests: malformed Ring 3 values never use
+panicking address construction; validation precedes mutation; one process
+cannot address another's private subtree; failed mapping/unmapping does not
+advance or partially expose the arena; deferred unmap frames cannot be reused
+before commit; input has one foreground owner; and no user fault, display/input
+request, mouse error, or desktop lifecycle event can halt Ring 0.
 
 ## Locking invariant
 
@@ -625,15 +1019,28 @@ automatically. The rest operate purely on one `AddressSpace`'s own
 physical memory via the physical-memory-offset mapping -- no `spin::Mutex`
 involved at all, so the deadlock shape above cannot occur there by
 construction. Their safety instead comes from a different, equally load-bearing
-invariant: exactly one execution context ever touches a given
-`AddressSpace` at a time. During ELF loading it's exclusively owned by the
-spawning task's own call stack (not yet visible to the scheduler or any
-interrupt handler); during a syscall it's the *current* process's own
-space, and the syscall gate is an interrupt gate (CPU clears `IF` on
-entry), so nothing can preempt into a second reader/writer mid-syscall
-either. `task::schedule()` itself -- the one place that both changes CR3
-*and* frees a reclaimed `AddressSpace` -- runs the whole sequence inside a
-single `without_interrupts` block, same as before Phase 4.
+  invariant: exactly one execution context ever mutates a given
+  `AddressSpace` at a time. During ELF loading it is not yet scheduler-visible.
+  During a syscall it belongs to the current, single-threaded process; large
+  MMAP/MUNMAP calls may be preempted between bounded lock scopes, but no second
+  thread can enter Ring 3 and mutate that same space. `task::schedule()`
+  itself -- the one place that both changes CR3 *and* frees a reclaimed
+  `AddressSpace` -- runs the whole sequence inside a single
+  `without_interrupts` block, same as before Phase 4.
+
+**Phase 5 extension, audited before being added rather than after.**
+`input::QUEUE` is a new `spin::Mutex` reachable from two interrupt
+contexts (the keyboard ISR and the new mouse ISR) and from ordinary
+syscall context (`SYS_INPUT_POLL`) -- exactly the shape Bug 3 above fixed
+for `keyboard::QUEUE`, so `input::with_queue` was built as a
+`without_interrupts`-wrapped single access point from the start, the same
+pattern, audited against this exact history before the module was written
+rather than discovered as a bug afterward. `mouse.rs`'s packet decoder
+(`DECODER`) is a `static mut` rather than a lock at
+all -- deliberately: it has exactly one writer (the mouse ISR, which cannot
+reenter itself; the CPU keeps interrupts disabled for one interrupt gate's
+duration), so there is no second context that could ever contend for it,
+and no lock is needed to make that true.
 
 ## Networking
 
@@ -642,14 +1049,19 @@ Loopback driver echoes packets in RAM. `ping localhost` validates the stack. HTT
 ## Build pipeline
 
 1. `userland/hello` (own `[workspace]`, not a member of the root one --
-   see that crate's `Cargo.toml`): six real, statically linked, fixed-address
-   ELF64 executables (`hello` + five `bad_*` fault-injection programs),
-   built from `cargo build --release` run *inside* that directory (its
-   `.cargo/config.toml` supplies the static-relocation/large-code-model/
-   no-PIE flags a fixed high address like `0x_7000_0000_0000` requires --
-   running from the repo root would silently miss that config).
+   see that crate's `Cargo.toml`): real, statically linked, fixed-address
+   ELF64 executables built from `cargo build --release` run *inside* that
+   directory (its `.cargo/config.toml` supplies the static-relocation/
+   large-code-model/no-PIE flags a fixed high address like
+   `0x_7000_0000_0000` requires -- running from the repo root would
+   silently miss that config). The current tree builds 19 ELF programs:
+   functional, hostile pointer/fault, VM rollback/permission, desktop, and
+   concurrency coverage, including `desktop` (Phase 5's Tuwaiq Desktop --
+   a multi-file binary under `src/bin/desktop/`, sharing this same crate
+   and build step rather than a separate one, since it needs no `alloc`
+   and no fixed address different from every other binary here).
 2. `cargo build -p kernel --target x86_64-unknown-none` -- `shell.rs`
-   embeds all six binaries from step 1 via `include_bytes!`.
+   embeds every binary from step 1 via `include_bytes!`.
 3. `cargo build -p tuwaiqos` → `build.rs` wraps kernel in BIOS image
 4. Output: `boot-bios-tuwaiqos.img`
 

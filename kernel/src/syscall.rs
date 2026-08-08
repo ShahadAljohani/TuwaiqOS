@@ -12,12 +12,21 @@
 //! argument) -- there is no `errno`-style detail channel in this minimal
 //! ABI, only success/failure.
 //!
-//! | # | name     | args                  | returns                    |
-//! |---|----------|-----------------------|-----------------------------|
-//! | 0 | EXIT     | `code: i32`           | never returns               |
-//! | 1 | WRITE    | `ptr: *u8, len: usize`| bytes written, or `-1`      |
-//! | 2 | YIELD    | --                    | `0`                         |
-//! | 3 | GETPID   | --                    | this process's task id      |
+//! | # | name           | args                          | returns                     |
+//! |---|----------------|-------------------------------|------------------------------|
+//! | 0 | EXIT           | `code: i32`                   | never returns                |
+//! | 1 | WRITE          | `ptr: *u8, len: usize`        | bytes written, or `-1`       |
+//! | 2 | YIELD          | --                             | `0`                          |
+//! | 3 | GETPID         | --                             | this process's task id       |
+//! | 4 | MMAP           | `len: usize, writable: bool`  | new region's address, or `-1`|
+//! | 5 | MUNMAP         | `ptr: *u8, len: usize`        | `0`, or `-1`                 |
+//! | 6 | DISPLAY_INFO   | `out_ptr: *mut u8, out_len`   | `0`, or `-1`                 |
+//! | 7 | DISPLAY_PRESENT| `ptr: *u8, len: usize`        | `0`, or `-1`                 |
+//! | 8 | INPUT_POLL     | `out_ptr: *mut u8, out_len`   | `1` (event written)/`0`/`-1` |
+//! | 9 | UPTIME_TICKS   | --                             | PIT ticks since boot         |
+//!
+//! (Phase 5 -- see `ARCHITECTURE.md`'s "Phase 5: userland runtime and the
+//! first graphical desktop" section for the design behind 4-9.)
 //!
 //! Any other number is rejected with `-1` -- logged, not a fault, and the
 //! calling process keeps running (see `dispatch`'s `_` arm).
@@ -41,14 +50,13 @@
 //!
 //! ## Pointer validation
 //!
-//! `WRITE` is the only syscall here that takes a pointer. Its length is
-//! capped (`MAX_WRITE_LEN`), and the bytes are never dereferenced directly
-//! under the caller's live CR3 -- `task::copy_from_current_user` walks the
-//! calling process's own page tables first (`paging::translate_in_address_space`
-//! under the hood) and only reads through the physical-memory-offset
-//! mapping once every page in range is confirmed `PRESENT | USER_ACCESSIBLE`.
-//! An invalid pointer or range is a clean `-1`, never a Ring 0 page fault
-//! from kernel code trusting a user-supplied address.
+//! `WRITE`, `MUNMAP`, `DISPLAY_INFO`, `DISPLAY_PRESENT`, and `INPUT_POLL`
+//! accept Ring-3-supplied addresses. Every raw address is converted with the
+//! fallible `VirtAddr::try_new` path, constrained to the private user region,
+//! checked for range overflow, and walked through the calling process's own
+//! page tables before any byte is read, written, presented, or unmapped.
+//! Required permissions are checked for the whole range before mutation. A
+//! malformed address or range is a clean `-1`, never a Ring-0 panic or fault.
 
 use crate::task;
 
@@ -56,6 +64,12 @@ const SYS_EXIT: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_YIELD: u64 = 2;
 const SYS_GETPID: u64 = 3;
+const SYS_MMAP: u64 = 4;
+const SYS_MUNMAP: u64 = 5;
+const SYS_DISPLAY_INFO: u64 = 6;
+const SYS_DISPLAY_PRESENT: u64 = 7;
+const SYS_INPUT_POLL: u64 = 8;
+const SYS_UPTIME_TICKS: u64 = 9;
 
 /// Upper bound on a single `WRITE`'s length -- generous for this ABI's
 /// only real use (a handful of short diagnostic lines from `hello_user`),
@@ -147,9 +161,9 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
     // Safety: `frame` was constructed by `syscall_entry`'s own prologue,
     // immediately before this call, pointing at a live, exclusively-owned
     // region of the current task's own kernel stack -- valid for exactly
-    // the duration of this call, and nothing else touches it concurrently
-    // (single-core kernel, interrupts disabled for the whole interrupt-gate
-    // duration).
+    // the duration of this call. Long VM syscalls may enable interrupts and
+    // be preempted between bounded lock scopes, but another task runs on its
+    // own kernel stack; nothing can alias this suspended task's frame.
     let frame = unsafe { &mut *frame };
     let result = dispatch(frame.rax, frame.rdi, frame.rsi, frame.rdx);
     frame.rax = result as u64;
@@ -165,6 +179,12 @@ fn dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> i64 {
         SYS_WRITE => sys_write(a1, a2),
         SYS_YIELD => sys_yield(),
         SYS_GETPID => sys_getpid(),
+        SYS_MMAP => sys_mmap(a1, a2),
+        SYS_MUNMAP => sys_munmap(a1, a2),
+        SYS_DISPLAY_INFO => sys_display_info(a1, a2),
+        SYS_DISPLAY_PRESENT => sys_display_present(a1, a2),
+        SYS_INPUT_POLL => sys_input_poll(a1, a2),
+        SYS_UPTIME_TICKS => sys_uptime_ticks(),
         _ => {
             // Exactly the "unknown syscall numbers must fail safely"
             // requirement: logged for visibility, a plain error return,
@@ -186,7 +206,10 @@ fn sys_exit(code: i32) -> ! {
 }
 
 fn sys_write(ptr: u64, len: u64) -> i64 {
-    if len as usize > MAX_WRITE_LEN {
+    let Ok(len_usize) = usize::try_from(len) else {
+        return -1;
+    };
+    if len_usize > MAX_WRITE_LEN {
         crate::serial_println!(
             "syscall: WRITE rejected -- len {} exceeds max {}",
             len,
@@ -195,7 +218,7 @@ fn sys_write(ptr: u64, len: u64) -> i64 {
         return -1;
     }
 
-    match task::copy_from_current_user(ptr, len as usize) {
+    match task::copy_from_current_user(ptr, len_usize) {
         Some(bytes) => {
             // This syscall's contract is "write these bytes," not "write
             // valid UTF-8" -- invalid sequences are replaced rather than
@@ -224,4 +247,146 @@ fn sys_yield() -> i64 {
 
 fn sys_getpid() -> i64 {
     task::current_task_id().map(i64::from).unwrap_or(-1)
+}
+
+/// `MMAP(len, writable)`. See `task::mmap_in_current_process` for the full
+/// contract (arena bounds, permission handling, and transactional rollback
+/// on mapping/zeroing/permission failure). `writable` is `a2 != 0`, matching this
+/// ABI's usual "any nonzero value is true" convention for boolean-ish
+/// arguments.
+fn sys_mmap(len: u64, writable: u64) -> i64 {
+    match task::mmap_in_current_process(len, writable != 0) {
+        Some(addr) => addr as i64,
+        None => {
+            crate::serial_println!(
+                "syscall: MMAP rejected (len={}, writable={})",
+                len,
+                writable != 0
+            );
+            -1
+        }
+    }
+}
+
+/// `MUNMAP(ptr, len)`. See `task::munmap_in_current_process` for the full
+/// contract (page-alignment, arena-bounds requirements).
+fn sys_munmap(ptr: u64, len: u64) -> i64 {
+    if task::munmap_in_current_process(ptr, len) {
+        0
+    } else {
+        crate::serial_println!("syscall: MUNMAP rejected (ptr={:#x}, len={})", ptr, len);
+        -1
+    }
+}
+
+/// `DISPLAY_INFO(out_ptr, out_len)`: writes a fixed 20-byte
+/// `display::DisplayInfo` record (see that module for the exact layout)
+/// into the caller's own buffer at `out_ptr`. Rejects a buffer smaller than
+/// the record, a display that isn't active, or an invalid/non-writable
+/// destination -- the actual write goes through
+/// `task::copy_to_current_user`, which (via `paging::write_bytes_in_address_space`)
+/// requires the destination to be both `WRITABLE` and `USER_ACCESSIBLE` in
+/// the caller's own address space, so a kernel-address `out_ptr` is
+/// rejected rather than silently written through.
+fn sys_display_info(out_ptr: u64, out_len: u64) -> i64 {
+    let Some(info) = crate::display::info() else {
+        return -1;
+    };
+    let bytes = info.to_le_bytes();
+    let Ok(out_len_usize) = usize::try_from(out_len) else {
+        return -1;
+    };
+    if out_len_usize < bytes.len() {
+        return -1;
+    }
+    if task::copy_to_current_user(out_ptr, &bytes) {
+        0
+    } else {
+        crate::serial_println!(
+            "syscall: DISPLAY_INFO rejected -- invalid destination (ptr={:#x}, len={})",
+            out_ptr,
+            out_len
+        );
+        -1
+    }
+}
+
+/// `DISPLAY_PRESENT(ptr, len)`: copies the caller's own validated buffer at
+/// `ptr` (exactly `len` bytes, which must exactly match the real
+/// framebuffer's byte size) into the real, kernel-owned framebuffer -- see
+/// `display::present` for the full validation this goes through (exact
+/// size match, checked arithmetic, per-page `PRESENT | USER_ACCESSIBLE`
+/// validation of the entire source range before a single byte is copied).
+fn sys_display_present(ptr: u64, len: u64) -> i64 {
+    let Ok(len) = usize::try_from(len) else {
+        return -1;
+    };
+    match crate::display::present(ptr, len) {
+        Ok(()) => 0,
+        Err(reason) => {
+            crate::serial_println!(
+                "syscall: DISPLAY_PRESENT rejected -- {} (ptr={:#x}, len={})",
+                reason,
+                ptr,
+                len
+            );
+            -1
+        }
+    }
+}
+
+/// `INPUT_POLL(out_ptr, out_len)`: writes the next queued input event (see
+/// `input::InputEvent`'s fixed 8-byte encoding) into the caller's own
+/// buffer, or nothing if the queue is empty. Returns `1` if an event was
+/// written, `0` if the queue was empty (not an error -- callers poll in a
+/// loop and are expected to see this constantly), `-1` for an invalid
+/// destination buffer.
+fn sys_input_poll(out_ptr: u64, out_len: u64) -> i64 {
+    let Some(caller_pid) = task::current_task_id() else {
+        return -1;
+    };
+    if crate::keyboard::foreground_process_id() != Some(caller_pid) {
+        crate::serial_println!(
+            "syscall: INPUT_POLL rejected -- pid {} is not foreground owner",
+            caller_pid
+        );
+        return -1;
+    }
+    let bytes = crate::input::ENCODED_EVENT_LEN;
+    let Ok(out_len) = usize::try_from(out_len) else {
+        return -1;
+    };
+    if out_len < bytes {
+        return -1;
+    }
+    // Validate before looking at queue state. Apart from making an invalid
+    // pointer return `-1` even while the queue is empty, this ordering is what
+    // guarantees a pending event cannot be consumed/lost by a failed copy.
+    if !task::validate_current_user_range(out_ptr, bytes, true) {
+        crate::serial_println!(
+            "syscall: INPUT_POLL rejected -- invalid destination (ptr={:#x}, len={})",
+            out_ptr,
+            out_len
+        );
+        return -1;
+    }
+    match crate::input::poll() {
+        Some(event) => {
+            if task::copy_to_current_user(out_ptr, &event.to_le_bytes()) {
+                1
+            } else {
+                crate::serial_println!(
+                    "syscall: INPUT_POLL rejected -- invalid destination (ptr={:#x}, len={})",
+                    out_ptr,
+                    out_len
+                );
+                -1
+            }
+        }
+        None => 0,
+    }
+}
+
+fn sys_uptime_ticks() -> i64 {
+    crate::interrupts::ticks() as i64
 }

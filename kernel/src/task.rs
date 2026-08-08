@@ -63,6 +63,16 @@ const INITIAL_FRAME_SIZE: usize = 7 * 8;
 /// `interrupts.rs` -- so 5 ticks is a 50 ms time slice).
 const TIME_SLICE_TICKS: u64 = 5;
 
+/// How long a `Terminated` task's `Tcb` (and its 32 KiB kernel stack) stays
+/// reachable via `ps`/`taskinfo`/`task::info` before automatic reaping
+/// removes it -- 500 ticks (5 s at the PIT's 100 Hz) is generously longer
+/// than the few-microsecond gap between `shell.rs`'s `wait_for_terminated`
+/// returning and its immediate follow-up `task::info` read, so ordinary
+/// shell diagnostics never race a reap, while still being short enough
+/// that a kernel left running keeps reclaiming promptly rather than
+/// accumulating terminated `Tcb`s forever. See `Scheduler::reap_terminated`.
+const REAP_GRACE_TICKS: u64 = 500;
+
 /// Lifecycle state of a kernel task.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskState {
@@ -149,6 +159,15 @@ struct Tcb {
     /// kernel-only tasks (shell, idle, heartbeat), which run entirely at
     /// Ring 0 under the shared kernel address space.
     process: Option<ProcessState>,
+    /// Absolute tick count (see `interrupts::ticks`) at which this task
+    /// became `Terminated`, or 0 if it never has. Read by
+    /// `Scheduler::reap_terminated` to enforce `REAP_GRACE_TICKS` -- long
+    /// enough that `ps`/`taskinfo`/the immediate post-`wait_for_terminated`
+    /// read in `runelf`/`isolate` always still find the task, short enough
+    /// that a kernel left running keeps reclaiming `Tcb`s (and their 32 KiB
+    /// kernel stacks) promptly rather than accumulating them forever -- see
+    /// `ARCHITECTURE.md`'s Phase 5 section for the full reasoning.
+    terminated_at_tick: u64,
 }
 
 /// A user process's private state: its own address space and, once it has
@@ -164,6 +183,14 @@ struct ProcessState {
     entry_point: u64,
     user_stack_top: u64,
     exit_code: Option<i32>,
+    /// Bump pointer for this process's own anonymous-memory arena (`SYS_MMAP`
+    /// -- see `mmap_in_current_process`), starting at `paging::USER_MMAP_BASE`
+    /// and only ever moving up. No free-list/reuse in this minimal design --
+    /// `SYS_MUNMAP` genuinely unmaps and reclaims the underlying physical
+    /// frames, but the virtual address range it freed is not reused by a
+    /// later `SYS_MMAP` call within the same process (documented limitation,
+    /// see `ARCHITECTURE.md`).
+    mmap_next: u64,
 }
 
 struct Scheduler {
@@ -193,9 +220,67 @@ struct SwitchPlan {
 }
 
 impl Scheduler {
+    /// Remove every `Terminated` task that is *not* the currently running
+    /// one and has been `Terminated` for at least `REAP_GRACE_TICKS` (or,
+    /// if `force` is set, remove every such task regardless of how long
+    /// ago it terminated -- see `task::reap_now`, used by the `reap` shell
+    /// command and by tests that need deterministic, immediate reclamation
+    /// rather than waiting out the grace period).
+    ///
+    /// Never touches `self.current`: freeing a task's `Tcb` frees its 32 KiB
+    /// kernel stack too (an ordinary `Drop`, not special-cased), and that
+    /// stack is exactly what the CPU is physically executing on top of for
+    /// as long as that task remains current -- reaping it would be a
+    /// genuine use-after-free the instant this function, or anything it
+    /// calls, touched the stack again. Restricting reaping to non-current
+    /// tasks makes that impossible by construction, the same way
+    /// `schedule()` already restricts *address-space* reclamation to
+    /// "provably not the active CR3."
+    ///
+    /// A reaped task's address space is expected to already be `None` here
+    /// (freed synchronously by `kill()`, or by a prior `schedule()` call's
+    /// own post-switch reclaim when this same task was the one being
+    /// switched away from -- see both functions' docs); if one is somehow
+    /// still present this frees it too, defensively, which is sound for the
+    /// identical reason reaping the `Tcb` itself is: a task this function
+    /// is willing to remove is never the current one, so its address space
+    /// can never be the active CR3.
+    fn reap_terminated(&mut self, force: bool) {
+        let now = crate::interrupts::ticks();
+        let current_id = self.tasks[self.current].id;
+
+        let should_reap = |t: &Tcb| -> bool {
+            t.id != current_id
+                && t.state == TaskState::Terminated
+                && (force || now.saturating_sub(t.terminated_at_tick) >= REAP_GRACE_TICKS)
+        };
+
+        for tcb in self.tasks.iter_mut() {
+            if !should_reap(tcb) {
+                continue;
+            }
+            if let Some(process) = tcb.process.as_mut() {
+                if let Some(space) = process.address_space.take() {
+                    // Safety: `should_reap` confirmed `tcb.id != current_id`,
+                    // so this address space cannot be the active CR3.
+                    unsafe { paging::free_address_space(space) };
+                }
+            }
+        }
+
+        self.tasks.retain(|t| !should_reap(t));
+        self.current = self
+            .tasks
+            .iter()
+            .position(|t| t.id == current_id)
+            .expect("current task vanished during reap");
+    }
+
     /// Decide whether a switch is needed and, if so, everything about it
     /// -- but do not perform any of it (see `SwitchPlan`'s docs).
     fn prepare_switch(&mut self) -> Option<SwitchPlan> {
+        self.reap_terminated(false);
+
         let n = self.tasks.len();
         if n < 2 {
             return None;
@@ -205,12 +290,26 @@ impl Scheduler {
             self.tasks[self.current].state = TaskState::Ready;
         }
 
-        let mut next = self.current;
-        for offset in 1..=n {
-            let idx = (self.current + offset) % n;
-            if self.tasks[idx].state == TaskState::Ready {
-                next = idx;
-                break;
+        let requested = FOREGROUND_WAKE_ID.swap(0, Ordering::AcqRel);
+        let mut next = if requested != 0 {
+            self.tasks
+                .iter()
+                .position(|task| {
+                    task.id == requested
+                        && task.state == TaskState::Ready
+                        && task.id != self.tasks[self.current].id
+                })
+                .unwrap_or(self.current)
+        } else {
+            self.current
+        };
+        if next == self.current {
+            for offset in 1..=n {
+                let idx = (self.current + offset) % n;
+                if self.tasks[idx].state == TaskState::Ready {
+                    next = idx;
+                    break;
+                }
             }
         }
 
@@ -265,6 +364,12 @@ impl Scheduler {
 static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 static NEXT_ID: AtomicU32 = AtomicU32::new(3); // 1 = shell, 2 = idle
 static TICKS_SINCE_SWITCH: AtomicU64 = AtomicU64::new(0);
+static FOREGROUND_WAKE_ID: AtomicU32 = AtomicU32::new(0);
+static VM_BATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+static VM_BATCH_TOTAL_CYCLES: AtomicU64 = AtomicU64::new(0);
+static VM_BATCH_MAX_CYCLES: AtomicU64 = AtomicU64::new(0);
+static VM_BATCH_MAX_KIND: AtomicU32 = AtomicU32::new(0);
+static MMAP_FAIL_AFTER_PAGES: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// The only sanctioned way to touch `SCHEDULER`. Every call site used to
 /// take `SCHEDULER.lock()` directly; several (`init`, `spawn`, `list`,
@@ -291,6 +396,75 @@ where
         let mut guard = SCHEDULER.lock();
         f(&mut guard)
     })
+}
+
+fn with_vm_batch<F, R>(kind: u32, f: F) -> R
+where
+    F: FnOnce(&mut Option<Scheduler>) -> R,
+{
+    let started = unsafe { core::arch::x86_64::_rdtsc() };
+    let result = with_scheduler(f);
+    let cycles = unsafe { core::arch::x86_64::_rdtsc() }.saturating_sub(started);
+    record_vm_batch_cycles(cycles, kind);
+    result
+}
+
+fn record_vm_batch_cycles(cycles: u64, kind: u32) {
+    VM_BATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+    VM_BATCH_TOTAL_CYCLES.fetch_add(cycles, Ordering::Relaxed);
+    let mut current = VM_BATCH_MAX_CYCLES.load(Ordering::Relaxed);
+    while cycles > current {
+        match VM_BATCH_MAX_CYCLES.compare_exchange_weak(
+            current,
+            cycles,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                VM_BATCH_MAX_KIND.store(kind, Ordering::Relaxed);
+                break;
+            }
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct VmBatchTelemetry {
+    pub count: u64,
+    pub total_cycles: u64,
+    pub max_cycles: u64,
+    pub max_kind: u32,
+}
+
+pub fn reset_vm_batch_telemetry() {
+    VM_BATCH_COUNT.store(0, Ordering::Relaxed);
+    VM_BATCH_TOTAL_CYCLES.store(0, Ordering::Relaxed);
+    VM_BATCH_MAX_CYCLES.store(0, Ordering::Relaxed);
+    VM_BATCH_MAX_KIND.store(0, Ordering::Relaxed);
+}
+
+pub fn vm_batch_telemetry() -> VmBatchTelemetry {
+    VmBatchTelemetry {
+        count: VM_BATCH_COUNT.load(Ordering::Relaxed),
+        total_cycles: VM_BATCH_TOTAL_CYCLES.load(Ordering::Relaxed),
+        max_cycles: VM_BATCH_MAX_CYCLES.load(Ordering::Relaxed),
+        max_kind: VM_BATCH_MAX_KIND.load(Ordering::Relaxed),
+    }
+}
+
+/// Arm one deterministic, kernel-internal MMAP rollback test. This is not
+/// reachable from the syscall ABI; the shell acceptance command uses it once
+/// before starting the dedicated hostile ELF.
+pub fn inject_next_mmap_failure_after(mapped_pages: u64) {
+    MMAP_FAIL_AFTER_PAGES.store(mapped_pages, Ordering::Release);
+}
+
+/// Disarm the kernel-internal MMAP rollback test hook. The shell calls this
+/// on every completion path so a failed process spawn can never leave a
+/// latent failure armed for an unrelated userspace process.
+pub fn clear_mmap_failure_injection() {
+    MMAP_FAIL_AFTER_PAGES.store(u64::MAX, Ordering::Release);
 }
 
 // Safety: `context_switch` only touches the callee-saved registers SysV
@@ -389,6 +563,7 @@ pub fn init() {
         wake_at_tick: 0,
         kernel_stack_top: 0,
         process: None,
+        terminated_at_tick: 0,
     };
     let idle = new_tcb(2, "idle", idle_entry);
 
@@ -443,6 +618,7 @@ fn new_tcb(id: u32, name: &str, entry: fn()) -> Tcb {
         wake_at_tick: 0,
         kernel_stack_top: aligned_top as u64,
         process: None,
+        terminated_at_tick: 0,
     }
 }
 
@@ -492,7 +668,9 @@ fn new_user_tcb(
             entry_point,
             user_stack_top,
             exit_code: None,
+            mmap_next: paging::USER_MMAP_BASE,
         }),
+        terminated_at_tick: 0,
     }
 }
 
@@ -520,6 +698,19 @@ pub fn spawn(name: &str, entry: fn()) -> u32 {
         sched.tasks.push(Box::new(tcb));
     });
     id
+}
+
+/// Request one latency-sensitive scheduling choice for a foreground process.
+/// The request is consumed exactly once by `prepare_switch`; it does not alter
+/// the timer quantum or permanently prioritize the task over round-robin peers.
+pub fn request_foreground_wake(id: u32) {
+    FOREGROUND_WAKE_ID.store(id, Ordering::Release);
+    // Ask the next 100 Hz PIT interrupt to run the scheduler instead of
+    // waiting out the current task's remaining 50 ms quantum. The request is
+    // still consumed once in `prepare_switch`; if `id` is already current,
+    // ordinary round-robin selection applies and continuous input cannot pin
+    // the desktop on CPU.
+    TICKS_SINCE_SWITCH.store(TIME_SLICE_TICKS, Ordering::Release);
 }
 
 /// Called from `interrupts::timer_interrupt_handler` on every PIT tick.
@@ -644,6 +835,7 @@ pub fn exit_with_code(code: i32) -> ! {
         if let Some(sched) = slot.as_mut() {
             let idx = sched.current;
             sched.tasks[idx].state = TaskState::Terminated;
+            sched.tasks[idx].terminated_at_tick = crate::interrupts::ticks();
             if let Some(process) = sched.tasks[idx].process.as_mut() {
                 process.exit_code = Some(code);
             }
@@ -679,6 +871,15 @@ pub fn list() -> Result<Vec<Task>, &'static str> {
         let sched = slot.as_ref().ok_or("scheduler not initialized")?;
         Ok(sched.tasks.iter().map(|t| snapshot(t)).collect())
     })
+}
+
+/// Number of `Tcb`s currently in the scheduler's task list -- including
+/// `Terminated` ones still inside their reap grace period. Diagnostic/test
+/// use (`stress` shell command, reap tests): proves the count genuinely
+/// shrinks back down after a batch of spawn/exit/reap cycles rather than
+/// growing without bound.
+pub fn task_count() -> usize {
+    with_scheduler(|slot| slot.as_ref().map(|s| s.tasks.len()).unwrap_or(0))
 }
 
 /// Detailed information about one task.
@@ -717,6 +918,7 @@ pub fn kill(id: u32) -> Result<(), &'static str> {
         match sched.tasks.iter_mut().find(|t| t.id == id) {
             Some(task) => {
                 task.state = TaskState::Terminated;
+                task.terminated_at_tick = crate::interrupts::ticks();
                 if is_current {
                     Ok(None)
                 } else {
@@ -738,6 +940,24 @@ pub fn kill(id: u32) -> Result<(), &'static str> {
 
 pub fn state_label(state: TaskState) -> &'static str {
     state.label()
+}
+
+/// Immediately reap every `Terminated` non-current task, ignoring
+/// `REAP_GRACE_TICKS` -- the `reap` shell command's implementation, and the
+/// deterministic hook stress tests use (`spawn`/wait/`kill` a batch of
+/// processes, call this once, then compare `paging::frame_stats()`/task
+/// count against a recorded baseline) instead of needing to either wait out
+/// the real grace period or depend on wall-clock timing for a repeatable
+/// result. Organic reaping (`Scheduler::prepare_switch`, every scheduler
+/// decision) already does the same thing automatically once a task has
+/// been `Terminated` long enough; this only changes *when* it happens, not
+/// *what* happens or *how* it's made safe.
+pub fn reap_now() {
+    with_scheduler(|slot| {
+        if let Some(sched) = slot.as_mut() {
+            sched.reap_terminated(true);
+        }
+    });
 }
 
 pub fn privilege_label(privilege: Privilege) -> &'static str {
@@ -774,14 +994,572 @@ fn current_process_entry() -> Option<(u64, u64)> {
 /// dereference of a user-supplied address.
 pub fn copy_from_current_user(addr: u64, len: usize) -> Option<Vec<u8>> {
     with_scheduler(|slot| {
+        let user_addr = VirtAddr::try_new(addr).ok()?;
+        if user_addr.as_u64() != addr {
+            return None;
+        }
         let sched = slot.as_ref()?;
         let space = sched.tasks[sched.current]
             .process
             .as_ref()?
             .address_space
             .as_ref()?;
-        paging::read_bytes_from_address_space(space, VirtAddr::new(addr), len)
+        paging::read_bytes_from_address_space(space, user_addr, len)
     })
+}
+
+/// Copy `data` into the *currently running* task's own user memory at
+/// `addr` -- the write-direction counterpart to `copy_from_current_user`,
+/// used by syscalls that hand kernel-computed data back to userspace
+/// through a caller-supplied destination pointer (`DISPLAY_INFO`,
+/// `INPUT_POLL`). Goes through `paging::write_bytes_in_address_space`,
+/// which (as of Phase 5) requires both `WRITABLE` and `USER_ACCESSIBLE` on
+/// every page touched -- a destination that resolves to kernel memory
+/// (`WRITABLE` but never `USER_ACCESSIBLE`) is rejected, not silently
+/// written through. Returns `false` if the current task isn't a user
+/// process or if any byte in range fails validation.
+pub fn copy_to_current_user(addr: u64, data: &[u8]) -> bool {
+    with_scheduler(|slot| {
+        let user_addr = VirtAddr::try_new(addr).ok()?;
+        if user_addr.as_u64() != addr {
+            return None;
+        }
+        let sched = slot.as_ref()?;
+        let space = sched.tasks[sched.current]
+            .process
+            .as_ref()?
+            .address_space
+            .as_ref()?;
+        paging::write_bytes_in_address_space(space, user_addr, data).ok()
+    })
+    .is_some()
+}
+
+/// Validate an entire caller-supplied range in the currently running user
+/// process without reading from or writing to it. `INPUT_POLL` uses this
+/// before removing an event from the queue, including when the queue is empty,
+/// so an invalid destination always reports `-1` and can never consume data.
+pub fn validate_current_user_range(addr: u64, len: usize, writable: bool) -> bool {
+    with_scheduler(|slot| {
+        let sched = slot.as_ref()?;
+        let space = sched.tasks[sched.current]
+            .process
+            .as_ref()?
+            .address_space
+            .as_ref()?;
+        paging::validate_user_range(space, addr, len, writable).ok()
+    })
+    .is_some()
+}
+
+/// Read-only access to the currently running task's own address space, for
+/// syscalls that need to hand it to a `paging::` function taking `&AddressSpace`
+/// directly (`display::present`) rather than going through one of the
+/// `copy_*_current_user` wrappers above. Runs the whole closure `f` inside
+/// `with_scheduler` so the reference stays valid and no other execution
+/// context can observe or mutate the scheduler state mid-call -- `f` must
+/// not itself try to re-enter the scheduler (call `with_scheduler`/anything
+/// built on it) or it will deadlock against itself, same caveat as every
+/// other `with_scheduler` closure in this module.
+pub fn with_current_address_space<R>(f: impl FnOnce(&paging::AddressSpace) -> R) -> Option<R> {
+    with_scheduler(|slot| {
+        let sched = slot.as_ref()?;
+        let space = sched.tasks[sched.current]
+            .process
+            .as_ref()?
+            .address_space
+            .as_ref()?;
+        Some(f(space))
+    })
+}
+
+/// Round `len` up to a whole number of 4 KiB pages -- shared by
+/// `mmap_in_current_process` and anywhere else that needs to turn a byte
+/// count into a page count. `None` on overflow (an absurd `len` close to
+/// `u64::MAX`), never a silently wrapped/truncated result.
+fn page_count_for(len: u64) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    len.checked_add(0xFFF)
+        .map(|rounded| (rounded & !0xFFF) / 4096)
+}
+
+/// Upper bound on a single `SYS_MMAP` request -- generous for the
+/// desktop's own needs (a 1280x720x4-byte back-buffer is ~3.5 MiB) while
+/// still bounding how much any one syscall can make the kernel map on a
+/// caller's behalf.
+pub const MAX_MMAP_LEN: u64 = 64 * 1024 * 1024;
+
+/// Bound VM work done while the scheduler lock and interrupts are held. Long
+/// syscalls explicitly enable interrupts between these batches and yield, so
+/// a hostile maximum-size request cannot suppress the 100 Hz clock or starve
+/// round-robin peers.
+pub const VM_BATCH_PAGES: u64 = 4;
+
+fn current_space_matches_mmap_start(process: &ProcessState, start: u64) -> bool {
+    process.mmap_next == start && process.address_space.is_some()
+}
+
+fn rollback_mmap_or_exit(
+    start: u64,
+    mapped_pages: u64,
+    requested_pages: u64,
+    owned_frames_before: usize,
+) {
+    let mut rolled_back = 0u64;
+    while rolled_back < mapped_pages {
+        let batch = VM_BATCH_PAGES.min(mapped_pages - rolled_back);
+        let batch_start = start + rolled_back * 4096;
+        let restored = with_vm_batch(14, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return false;
+            };
+            let Some(space) = sched.tasks[sched.current]
+                .process
+                .as_mut()
+                .and_then(|process| process.address_space.as_mut())
+            else {
+                return false;
+            };
+            paging::unmap_range_in_address_space_atomic(space, batch_start, batch).is_ok()
+        });
+        if !restored {
+            crate::serial_println!(
+                "mmap: rollback invariant failed at {:#x}; terminating caller fail-closed",
+                batch_start
+            );
+            exit_with_code(255);
+        }
+        rolled_back += batch;
+    }
+
+    let exact = with_vm_batch(15, |slot| {
+        let Some(sched) = slot.as_mut() else {
+            return None;
+        };
+        let Some(space) = sched.tasks[sched.current]
+            .process
+            .as_mut()
+            .and_then(|process| process.address_space.as_mut())
+        else {
+            return None;
+        };
+        paging::clean_up_empty_tables_in_range(space, start, requested_pages).ok()?;
+        Some(space.frame_count())
+    });
+    let Some(owned_frames_after) = exact else {
+        crate::serial_println!("mmap: page-table rollback cleanup failed; terminating caller");
+        exit_with_code(255);
+    };
+    crate::serial_println!(
+        "mmap: rollback frames before={} after={}",
+        owned_frames_before,
+        owned_frames_after
+    );
+    if owned_frames_after != owned_frames_before {
+        crate::serial_println!("mmap: rollback ownership mismatch; terminating caller fail-closed");
+        exit_with_code(255);
+    }
+}
+
+/// `SYS_MMAP`'s implementation: grow the *currently running* user
+/// process's own anonymous-memory arena by `len` bytes (rounded up to
+/// whole pages) and return the new region's starting address, or `None` on
+/// any failure (not a user process, `len` is zero/absurd, the arena is
+/// exhausted, or the underlying mapping failed -- e.g. out of physical
+/// frames).
+///
+/// Every mapped page is `PRESENT | USER_ACCESSIBLE`, `NO_EXECUTE`
+/// unconditionally (this ABI has no concept of executable anonymous
+/// memory -- see `ARCHITECTURE.md`), and `WRITABLE` only if `writable` is
+/// set; the freshly mapped range is zeroed before the address is handed
+/// back, so a process can never observe another process's (or its own
+/// prior mapping's) leftover physical-memory contents. Bounded to
+/// `paging::USER_MMAP_BASE..USER_MMAP_LIMIT` -- independently re-checked by
+/// `paging::map_in_address_space` itself (defense in depth, same pattern
+/// as the ELF loader), so this can never reach kernel memory or another
+/// process's address space no matter what this function does or doesn't
+/// check.
+///
+/// Mapping, zero-fill, and final-permission installation are transactional at
+/// the syscall boundary: if any step fails, every leaf page installed for the
+/// request is unmapped and reclaimed, newly empty paging-structure frames are
+/// removed and reclaimed, and `mmap_next` is left unchanged. The rollback
+/// verifies the address space owns exactly its pre-call frame count before
+/// returning failure.
+pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
+    if len == 0 || len > MAX_MMAP_LEN {
+        return None;
+    }
+    let pages = page_count_for(len)?;
+    let region_len = pages.checked_mul(4096)?;
+
+    let (start, end, worst_case_frames, owned_frames_before) = with_vm_batch(1, |slot| {
+        let sched = slot.as_ref()?;
+        let process = sched.tasks[sched.current].process.as_ref()?;
+        let start = process.mmap_next;
+        let end = start.checked_add(region_len)?;
+        if end > paging::USER_MMAP_LIMIT {
+            return None;
+        }
+        let first_2m = start >> 21;
+        let last_2m = end.checked_sub(1)? >> 21;
+        let p1_tables = last_2m.checked_sub(first_2m)?.checked_add(1)?;
+        let worst_case_frames = pages.checked_add(p1_tables)?.checked_add(2)?;
+        let worst_case_frames = usize::try_from(worst_case_frames).ok()?;
+        let owned_frames_before = process.address_space.as_ref()?.frame_count();
+        Some((start, end, worst_case_frames, owned_frames_before))
+    })?;
+
+    // Admission control is conservative and mutation-free. A competing
+    // process may consume frames after this check once interrupts are enabled;
+    // any resulting mid-map failure is fully rolled back below.
+    if !paging::can_allocate_frames(worst_case_frames) {
+        return None;
+    }
+
+    // Safety: `MMAP` is entered through an interrupt gate with IF cleared.
+    // From this point onward no scheduler/paging borrow or lock escapes its
+    // bounded closure, so timer/IRQ preemption between batches is safe. IRET
+    // restores the caller's original flags on return.
+    x86_64::instructions::interrupts::enable();
+
+    // Prevalidate the complete destination before the first mutation.
+    let mut checked_pages = 0u64;
+    while checked_pages < pages {
+        let batch = VM_BATCH_PAGES.min(pages - checked_pages);
+        let batch_start = start + checked_pages * 4096;
+        let clear = with_vm_batch(2, |slot| {
+            let Some(sched) = slot.as_ref() else {
+                return false;
+            };
+            let Some(process) = sched.tasks[sched.current].process.as_ref() else {
+                return false;
+            };
+            if !current_space_matches_mmap_start(process, start) {
+                return false;
+            }
+            let space = process.address_space.as_ref().unwrap();
+            (0..batch).all(|offset| {
+                VirtAddr::try_new(batch_start + offset * 4096)
+                    .ok()
+                    .and_then(|addr| paging::translate_in_address_space(space, addr))
+                    .is_none()
+            })
+        });
+        if !clear {
+            return None;
+        }
+        checked_pages += batch;
+    }
+
+    let staging_flags = PageTableFlags::PRESENT
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::WRITABLE;
+    let mut mapped_pages = 0u64;
+    while mapped_pages < pages {
+        let fail_after = MMAP_FAIL_AFTER_PAGES.load(Ordering::Acquire);
+        if fail_after != u64::MAX && mapped_pages >= fail_after {
+            MMAP_FAIL_AFTER_PAGES.store(u64::MAX, Ordering::Release);
+            rollback_mmap_or_exit(start, mapped_pages, pages, owned_frames_before);
+            return None;
+        }
+        let batch = VM_BATCH_PAGES.min(pages - mapped_pages);
+        let batch_start = start + mapped_pages * 4096;
+        let mapped_now = with_vm_batch(3, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return 0;
+            };
+            let Some(process) = sched.tasks[sched.current].process.as_mut() else {
+                return 0;
+            };
+            if !current_space_matches_mmap_start(process, start) {
+                return 0;
+            }
+            let space = process.address_space.as_mut().unwrap();
+            let mut done = 0u64;
+            for offset in 0..batch {
+                let Ok(addr) = VirtAddr::try_new(batch_start + offset * 4096) else {
+                    break;
+                };
+                let page: Page<Size4KiB> = Page::containing_address(addr);
+                if paging::map_in_address_space(space, page, staging_flags).is_err() {
+                    break;
+                }
+                done += 1;
+            }
+            done
+        });
+        mapped_pages += mapped_now;
+        if mapped_now != batch {
+            rollback_mmap_or_exit(start, mapped_pages, pages, owned_frames_before);
+            return None;
+        }
+    }
+
+    let mut zeroed_pages = 0u64;
+    while zeroed_pages < pages {
+        let batch = VM_BATCH_PAGES.min(pages - zeroed_pages);
+        let batch_start = start + zeroed_pages * 4096;
+        let zeroed = with_vm_batch(4, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return false;
+            };
+            let Some(process) = sched.tasks[sched.current].process.as_mut() else {
+                return false;
+            };
+            let Some(space) = process.address_space.as_mut() else {
+                return false;
+            };
+            let Ok(addr) = VirtAddr::try_new(batch_start) else {
+                return false;
+            };
+            paging::zero_bytes_in_address_space(space, addr, batch * 4096).is_ok()
+        });
+        if !zeroed {
+            rollback_mmap_or_exit(start, mapped_pages, pages, owned_frames_before);
+            return None;
+        }
+        zeroed_pages += batch;
+    }
+
+    if !writable {
+        let final_flags =
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
+        let mut protected_pages = 0u64;
+        while protected_pages < pages {
+            let batch = VM_BATCH_PAGES.min(pages - protected_pages);
+            let batch_start = start + protected_pages * 4096;
+            let protected = with_vm_batch(5, |slot| {
+                let Some(sched) = slot.as_mut() else {
+                    return false;
+                };
+                let Some(space) = sched.tasks[sched.current]
+                    .process
+                    .as_mut()
+                    .and_then(|process| process.address_space.as_mut())
+                else {
+                    return false;
+                };
+                for offset in 0..batch {
+                    let Ok(addr) = VirtAddr::try_new(batch_start + offset * 4096) else {
+                        return false;
+                    };
+                    let page: Page<Size4KiB> = Page::containing_address(addr);
+                    if paging::update_flags_in_address_space(space, page, final_flags).is_err() {
+                        return false;
+                    }
+                }
+                true
+            });
+            if !protected {
+                rollback_mmap_or_exit(start, mapped_pages, pages, owned_frames_before);
+                return None;
+            }
+            protected_pages += batch;
+        }
+    }
+
+    let committed = with_vm_batch(6, |slot| {
+        let Some(sched) = slot.as_mut() else {
+            return false;
+        };
+        let Some(process) = sched.tasks[sched.current].process.as_mut() else {
+            return false;
+        };
+        if process.mmap_next != start {
+            return false;
+        }
+        process.mmap_next = end;
+        true
+    });
+    if !committed {
+        rollback_mmap_or_exit(start, mapped_pages, pages, owned_frames_before);
+        return None;
+    }
+    Some(start)
+}
+
+/// `SYS_MUNMAP`'s implementation: unmap `[ptr, ptr+len)` from the
+/// *currently running* user process's own address space and return the
+/// underlying physical frames to the global allocator. Both `ptr` and
+/// `len` must be exact multiples of 4 KiB (no partial-page unmaps -- every
+/// `SYS_MMAP` region already starts and ends on a page boundary, so a
+/// well-behaved caller never needs anything else), and the entire range
+/// must fall within `[paging::USER_MMAP_BASE, mmap_next)` -- the process's
+/// own mmap arena, and never past how far it has actually grown -- which
+/// rules out ever unmapping the ELF's own segments or the user stack (both
+/// live outside the mmap arena entirely) by construction, not by a
+/// case-by-case check.
+pub fn munmap_in_current_process(ptr: u64, len: u64) -> bool {
+    if len == 0 || ptr % 4096 != 0 || len % 4096 != 0 {
+        return false;
+    }
+    let Some(end) = ptr.checked_add(len) else {
+        return false;
+    };
+
+    let in_bounds = with_vm_batch(7, |slot| {
+        let Some(sched) = slot.as_ref() else {
+            return false;
+        };
+        let Some(process) = sched.tasks[sched.current].process.as_ref() else {
+            return false;
+        };
+        ptr >= paging::USER_MMAP_BASE && end <= process.mmap_next && process.address_space.is_some()
+    });
+    if !in_bounds {
+        return false;
+    }
+
+    // Safety: identical bounded-lock argument to `mmap_in_current_process`.
+    x86_64::instructions::interrupts::enable();
+    let pages = len / 4096;
+    let mut records = Vec::with_capacity(pages as usize);
+    let mut collected = 0u64;
+    while collected < pages {
+        let batch = VM_BATCH_PAGES.min(pages - collected);
+        let batch_start = ptr + collected * 4096;
+        let valid = with_vm_batch(8, |slot| {
+            let Some(sched) = slot.as_ref() else {
+                return false;
+            };
+            let Some(space) = sched.tasks[sched.current]
+                .process
+                .as_ref()
+                .and_then(|process| process.address_space.as_ref())
+            else {
+                return false;
+            };
+            paging::collect_unmap_records(space, batch_start, batch, &mut records).is_ok()
+        });
+        if !valid {
+            return false;
+        }
+        collected += batch;
+    }
+
+    let Some(frames) = paging::unmap_record_frames(&records) else {
+        return false;
+    };
+    let ownership_snapshot = with_vm_batch(9, |slot| {
+        slot.as_ref()
+            .and_then(|sched| sched.tasks[sched.current].process.as_ref())
+            .and_then(|process| process.address_space.as_ref())
+            .map(paging::owned_frame_snapshot)
+    });
+    let Some(ownership_snapshot) = ownership_snapshot else {
+        return false;
+    };
+    let Some(removals) = paging::plan_unmap_ownership(&ownership_snapshot, &frames) else {
+        return false;
+    };
+
+    let mut removed = 0usize;
+    while removed < records.len() {
+        let batch_end = (removed + VM_BATCH_PAGES as usize).min(records.len());
+        let ok = with_vm_batch(10, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return false;
+            };
+            let Some(space) = sched.tasks[sched.current]
+                .process
+                .as_mut()
+                .and_then(|process| process.address_space.as_mut())
+            else {
+                return false;
+            };
+            paging::unmap_records_atomic(space, &records[removed..batch_end]).is_ok()
+        });
+        if !ok {
+            let restored = with_vm_batch(11, |slot| {
+                let Some(sched) = slot.as_mut() else {
+                    return false;
+                };
+                let Some(space) = sched.tasks[sched.current]
+                    .process
+                    .as_mut()
+                    .and_then(|process| process.address_space.as_mut())
+                else {
+                    return false;
+                };
+                paging::restore_unmap_records(space, &records[..removed]).is_ok()
+            });
+            if !restored {
+                crate::serial_println!(
+                    "munmap: restoration invariant failed; terminating caller fail-closed"
+                );
+                exit_with_code(255);
+            }
+            return false;
+        }
+        removed = batch_end;
+    }
+
+    for removal_batch in removals.chunks(VM_BATCH_PAGES as usize) {
+        let ownership_removed = with_vm_batch(12, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return false;
+            };
+            let Some(space) = sched.tasks[sched.current]
+                .process
+                .as_mut()
+                .and_then(|process| process.address_space.as_mut())
+            else {
+                return false;
+            };
+            paging::remove_unmapped_ownership(space, removal_batch)
+        });
+        if !ownership_removed {
+            crate::serial_println!(
+                "munmap: ownership commit invariant failed; terminating caller fail-closed"
+            );
+            exit_with_code(255);
+        }
+        let release_frames: Vec<_> = removal_batch
+            .iter()
+            .map(paging::OwnershipRemoval::frame)
+            .collect();
+        let started = unsafe { core::arch::x86_64::_rdtsc() };
+        let released = paging::release_frames(&release_frames).is_ok();
+        let cycles = unsafe { core::arch::x86_64::_rdtsc() }.saturating_sub(started);
+        record_vm_batch_cycles(cycles, 13);
+        if !released {
+            crate::serial_println!(
+                "munmap: frame-release invariant failed; terminating caller fail-closed"
+            );
+            exit_with_code(255);
+        }
+    }
+    let mut cleaned = 0u64;
+    const TABLE_CLEANUP_BATCH_PAGES: u64 = 512;
+    while cleaned < pages {
+        let batch = TABLE_CLEANUP_BATCH_PAGES.min(pages - cleaned);
+        let batch_start = ptr + cleaned * 4096;
+        let cleanup_ok = with_vm_batch(15, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return false;
+            };
+            let Some(space) = sched.tasks[sched.current]
+                .process
+                .as_mut()
+                .and_then(|process| process.address_space.as_mut())
+            else {
+                return false;
+            };
+            paging::clean_up_empty_tables_in_range(space, batch_start, batch).is_ok()
+        });
+        if !cleanup_ok {
+            crate::serial_println!(
+                "munmap: page-table cleanup invariant failed; terminating caller fail-closed"
+            );
+            exit_with_code(255);
+        }
+        cleaned += batch;
+    }
+    true
 }
 
 /// Number of physical frames a process's address space currently owns --

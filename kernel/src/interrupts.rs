@@ -13,7 +13,7 @@ use spin::Mutex;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::{PrivilegeLevel, VirtAddr};
 
-use crate::{framebuffer_console, gdt, keyboard, syscall};
+use crate::{framebuffer_console, gdt, keyboard, mouse, syscall};
 
 /// The one vector Ring 3 code is allowed to invoke via `int n` -- the real
 /// syscall ABI now (see `syscall.rs`), registered below with DPL=3; every
@@ -56,6 +56,11 @@ pub static PICS: Mutex<ChainedPics> =
 pub enum InterruptIndex {
     Timer = PIC_1_OFFSET,
     Keyboard,
+    /// IRQ12, routed through the slave PIC's cascade line (IRQ2 on the
+    /// master) -- `PIC_2_OFFSET + 4`, vector 44. Only reachable at all once
+    /// `enable_mouse` unmasks both the cascade line and this line (see that
+    /// function's docs for why the two-line unmask is required).
+    Mouse = PIC_2_OFFSET + 4,
 }
 
 impl InterruptIndex {
@@ -69,6 +74,8 @@ impl InterruptIndex {
 }
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+static FIRST_TICK_TSC: AtomicU64 = AtomicU64::new(0);
+static LAST_TICK_TSC: AtomicU64 = AtomicU64::new(0);
 
 /// PIT channel 0 is programmed for this frequency in `init_pit`.
 const TIMER_HZ: u64 = 100;
@@ -82,6 +89,19 @@ pub fn ticks() -> u64 {
 /// a placeholder string. Zero until `init()` has enabled the PIT.
 pub fn uptime_seconds() -> u64 {
     ticks() / TIMER_HZ
+}
+
+/// Average invariant-TSC cycles observed per delivered PIT tick. Diagnostics
+/// use this to express short RDTSC measurements in timer-tick units without
+/// assuming a host or virtual CPU frequency.
+pub fn average_tsc_cycles_per_tick() -> Option<u64> {
+    let ticks = ticks();
+    let first = FIRST_TICK_TSC.load(Ordering::Relaxed);
+    let last = LAST_TICK_TSC.load(Ordering::Relaxed);
+    if ticks < 2 || first == 0 || last <= first {
+        return None;
+    }
+    Some((last - first) / (ticks - 1))
 }
 
 /// Halt the CPU until the next interrupt fires (timer or keyboard). Used by
@@ -120,6 +140,18 @@ lazy_static! {
         unsafe {
             idt[InterruptIndex::Keyboard.as_usize()]
                 .set_handler_fn(keyboard_interrupt_handler)
+                .set_stack_index(gdt::IRQ_IST_INDEX);
+        }
+
+        // Safety: same reasoning as the keyboard entry above -- mouse
+        // packets never redirect control flow, so a fixed IST stack is
+        // safe. Registered unconditionally at boot; the line itself stays
+        // masked (see `init` below) until `enable_mouse` runs, so no
+        // spurious vector-44 interrupt can arrive before `mouse::init` has
+        // actually programmed the device.
+        unsafe {
+            idt[InterruptIndex::Mouse.as_usize()]
+                .set_handler_fn(mouse_interrupt_handler)
                 .set_stack_index(gdt::IRQ_IST_INDEX);
         }
 
@@ -190,6 +222,40 @@ pub fn init() {
 
     x86_64::instructions::interrupts::enable();
     serial_println!("interrupts: IDT/PIC/PIT online, timer at {} Hz", TIMER_HZ);
+}
+
+/// Unmask IRQ12 (mouse) after `mouse::init()` has actually programmed the
+/// PS/2 auxiliary device -- called from `main.rs`, deliberately separate
+/// from `init()` above and from `mouse::init()` itself, so the sequence is
+/// always "program the device, *then* let the PIC start delivering its
+/// interrupts," never the reverse (which could deliver IRQ12 to a device
+/// still mid-configuration, or before `mouse.rs`'s packet-sync state is
+/// ready to receive it).
+///
+/// Also unmasks IRQ2, the master PIC's cascade line: real IRQ12 physically
+/// arrives *through* the slave PIC, whose own output is wired to the
+/// master's IRQ2 input, so the master must also let that line through or no
+/// slave-PIC interrupt (mouse included) can ever reach the CPU, regardless
+/// of the slave's own per-line mask.
+pub fn enable_mouse() {
+    // Unlike `init`'s own PIC setup (which runs *before* interrupts are
+    // enabled), this runs from ordinary boot context *after*
+    // `x86_64::instructions::interrupts::enable()` -- the 100 Hz timer is
+    // already live. Locking `PICS` here without disabling interrupts would
+    // reproduce Bugs 1/3/4 (see "Locking invariant" in ARCHITECTURE.md)
+    // exactly: a timer tick landing mid-lock would deadlock against
+    // `timer_interrupt_handler`'s own `PICS.lock()` for EOI, since that ISR
+    // cannot return (and so cannot release nothing -- it never acquired
+    // anything, it just spins) until this lock is released, which cannot
+    // happen until the ISR itself returns.
+    //
+    // Safety: PIC_1_OFFSET/PIC_2_OFFSET already match the vectors this
+    // IDT registers (see `init` above); this only changes which of those
+    // already-valid vectors are allowed to fire.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        PICS.lock().write_masks(0b1111_1000, 0b1110_1111);
+    });
+    serial_println!("interrupts: mouse IRQ (IRQ12 via cascade) unmasked");
 }
 
 /// Program PIT channel 0 (legacy 8253/8254) for a periodic square-wave
@@ -378,6 +444,9 @@ extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame)
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let _ = FIRST_TICK_TSC.compare_exchange(0, tsc, Ordering::Relaxed, Ordering::Relaxed);
+    LAST_TICK_TSC.store(tsc, Ordering::Relaxed);
     TICKS.fetch_add(1, Ordering::Relaxed);
     // Safety: EOI is only ever issued here, for the interrupt this ISR
     // itself is handling, matching the IRQ this vector is registered for.
@@ -409,5 +478,23 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    use x86_64::instructions::port::Port;
+
+    let mut data_port: Port<u8> = Port::new(0x60);
+    // Safety: the CPU only vectors here in response to IRQ12, at which
+    // point the PS/2 controller guarantees a byte is waiting at 0x60,
+    // exactly as for the keyboard handler above.
+    let byte: u8 = unsafe { data_port.read() };
+    mouse::on_byte(byte);
+
+    // Safety: same reasoning as the timer/keyboard handlers above -- EOI
+    // must be sent for this exact vector.
+    unsafe {
+        PICS.lock()
+            .notify_end_of_interrupt(InterruptIndex::Mouse.as_u8());
     }
 }
