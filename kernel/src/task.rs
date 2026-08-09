@@ -1064,12 +1064,33 @@ pub fn current_task_id() -> Option<u32> {
     })
 }
 
+pub fn current_process_name() -> Option<String> {
+    let (bytes, len) = with_scheduler(|slot| {
+        let sched = slot.as_ref()?;
+        let task = &sched.tasks[sched.current];
+        task.process.as_ref()?;
+        if task.name.len() > crate::vfs::NAME_MAX {
+            return None;
+        }
+        let mut bytes = [0u8; crate::vfs::NAME_MAX];
+        bytes[..task.name.len()].copy_from_slice(task.name.as_bytes());
+        Some((bytes, task.name.len()))
+    })?;
+    try_owned_string(core::str::from_utf8(&bytes[..len]).ok()?).ok()
+}
+
 pub fn current_working_directory() -> Option<String> {
-    with_scheduler(|slot| {
+    let (bytes, len) = with_scheduler(|slot| {
         let sched = slot.as_ref()?;
         let cwd = &sched.tasks[sched.current].process.as_ref()?.cwd;
-        try_owned_string(cwd).ok()
-    })
+        if cwd.len() > crate::vfs::PATH_MAX {
+            return None;
+        }
+        let mut bytes = [0u8; crate::vfs::PATH_MAX];
+        bytes[..cwd.len()].copy_from_slice(cwd.as_bytes());
+        Some((bytes, cwd.len()))
+    })?;
+    try_owned_string(core::str::from_utf8(&bytes[..len]).ok()?).ok()
 }
 
 pub fn set_current_working_directory(cwd: String) -> bool {
@@ -1147,6 +1168,30 @@ pub fn advance_file_for_current_process(handle: u32, amount: usize) -> bool {
     .is_some()
 }
 
+pub fn seek_file_for_current_process(handle: u32, offset: usize) -> bool {
+    let Some(index) = handle
+        .checked_sub(FIRST_FILE_HANDLE)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return false;
+    };
+    with_scheduler(|slot| {
+        let sched = slot.as_mut()?;
+        let file = sched.tasks[sched.current]
+            .process
+            .as_mut()?
+            .open_files
+            .get_mut(index)?
+            .as_mut()?;
+        if offset > file.data.len() {
+            return None;
+        }
+        file.offset = offset;
+        Some(())
+    })
+    .is_some()
+}
+
 pub fn close_file_for_current_process(handle: u32) -> bool {
     let Some(index) = handle
         .checked_sub(FIRST_FILE_HANDLE)
@@ -1187,6 +1232,9 @@ fn current_process_entry() -> Option<(u64, u64)> {
 /// ever reads memory a Ring 3 program pointed it at: never a raw pointer
 /// dereference of a user-supplied address.
 pub fn copy_from_current_user(addr: u64, len: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    out.resize(len, 0);
     with_scheduler(|slot| {
         let user_addr = VirtAddr::try_new(addr).ok()?;
         if user_addr.as_u64() != addr {
@@ -1198,8 +1246,9 @@ pub fn copy_from_current_user(addr: u64, len: usize) -> Option<Vec<u8>> {
             .as_ref()?
             .address_space
             .as_ref()?;
-        paging::read_bytes_from_address_space(space, user_addr, len)
-    })
+        paging::read_bytes_from_address_space_into(space, user_addr, &mut out).ok()
+    })?;
+    Some(out)
 }
 
 /// Copy `data` into the *currently running* task's own user memory at
@@ -1801,6 +1850,27 @@ pub fn spawn_user_process_with_cwd(
     elf_bytes: &[u8],
     cwd: &str,
 ) -> Result<u32, &'static str> {
+    spawn_user_process_with_state(name, elf_bytes, cwd, TaskState::Ready)
+}
+
+/// Build a complete process but leave it blocked until `activate_task`.
+/// Foreground launchers use this to perform ELF loading with interrupts
+/// enabled, then bind input ownership and make the task runnable in one short
+/// interrupt-disabled transition.
+pub fn spawn_user_process_suspended(
+    name: &str,
+    elf_bytes: &[u8],
+    cwd: &str,
+) -> Result<u32, &'static str> {
+    spawn_user_process_with_state(name, elf_bytes, cwd, TaskState::Blocked)
+}
+
+fn spawn_user_process_with_state(
+    name: &str,
+    elf_bytes: &[u8],
+    cwd: &str,
+    initial_state: TaskState,
+) -> Result<u32, &'static str> {
     if task_count() >= MAX_TASKS {
         return Err("task limit reached");
     }
@@ -1821,7 +1891,8 @@ pub fn spawn_user_process_with_cwd(
     // `new_address_space` and everything `build_user_tcb` had mapped so
     // far -- the PML4 at minimum, every ELF segment page and stack page
     // mapped before the failing step at worst.
-    let tcb = build_user_tcb(elf_bytes, resources, address_space)?;
+    let mut tcb = build_user_tcb(elf_bytes, resources, address_space)?;
+    tcb.state = initial_state;
     let mut tcb = match try_box_value(tcb) {
         Ok(tcb) => Some(tcb),
         Err(mut tcb) => {
@@ -1866,6 +1937,19 @@ pub fn spawn_user_process_with_cwd(
             Err(reason)
         }
     }
+}
+
+pub fn activate_task(id: u32) -> bool {
+    with_scheduler(|slot| {
+        let sched = slot.as_mut()?;
+        let task = sched.tasks.iter_mut().find(|task| task.id == id)?;
+        if task.state != TaskState::Blocked || task.wake_at_tick != 0 {
+            return None;
+        }
+        task.state = TaskState::Ready;
+        Some(())
+    })
+    .is_some()
 }
 
 /// Build a complete, ready-to-run `Tcb` for a new user process: load the

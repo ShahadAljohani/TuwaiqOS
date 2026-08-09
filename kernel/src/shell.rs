@@ -324,6 +324,7 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
             Ok(entries) => print_entries(mode, entries),
             Err(reason) => print_fs_error(mode, reason),
         },
+        "mounts" => handle_mounts(mode),
         "touch" => handle_touch(mode, args),
         "mkdir" => handle_mkdir(mode, args),
         "cat" => handle_cat(mode, args),
@@ -345,6 +346,9 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "runfs" => handle_runfs(mode, args),
         "installapp" => handle_install_app(mode, args),
         "vfstest" => handle_vfs_test(mode),
+        "storagetest" => handle_storage_test(mode),
+        "fsinterrupttest" => handle_fs_interrupted_write_test(mode),
+        "fsexhausttest" => handle_fs_exhaustion_test(mode),
         "aipreviewtest" => handle_ai_preview_test(mode),
         "desktopaitest" => handle_desktop_ai_test(mode),
         "isolate" => handle_isolate(mode, args),
@@ -379,6 +383,20 @@ fn print_entries(mode: ConsoleMode, entries: Vec<String>) {
         for entry in entries {
             println(mode, &entry);
         }
+    }
+}
+
+fn handle_mounts(mode: ConsoleMode) {
+    match vfs::mounts() {
+        Ok(mounts) => {
+            for mount in mounts {
+                print(mode, &mount.path);
+                print(mode, "  ");
+                print(mode, mount.label);
+                println(mode, if mount.read_only { "  ro" } else { "  rw" });
+            }
+        }
+        Err(reason) => print_fs_error(mode, reason),
     }
 }
 
@@ -531,6 +549,10 @@ fn embedded_program(name: &str) -> Option<&'static [u8]> {
             env!("CARGO_MANIFEST_DIR"),
             "/../target/x86_64-unknown-none/release/file_api_test"
         ))),
+        "file_mutation_test" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/file_mutation_test"
+        ))),
         "tuwaiq_ai" => Some(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../target/x86_64-unknown-none/release/tuwaiq_ai"
@@ -565,6 +587,7 @@ fn embedded_program_names() -> &'static [&'static str] {
         "desktop",
         "desktop_peer",
         "file_api_test",
+        "file_mutation_test",
         "tuwaiq_ai",
         "tuwaiq_ai_fault",
     ]
@@ -618,10 +641,28 @@ fn ensure_apps_directory() -> Result<(), &'static str> {
     }
 }
 
+fn ensure_directory(path: &str) -> Result<(), &'static str> {
+    match vfs::kind("/", path) {
+        Ok(vfs::NodeKind::Directory) => Ok(()),
+        Ok(vfs::NodeKind::File) => Err("expected directory is a file"),
+        Err(_) => vfs::create_dir("/", path),
+    }
+}
+
+fn ensure_app_data_directory(name: &str) -> Result<(), &'static str> {
+    ensure_directory("/data")?;
+    let mut path = String::from("/data/");
+    path.try_reserve_exact(name.len())
+        .map_err(|_| "application data path allocation failed")?;
+    path.push_str(name);
+    ensure_directory(&path)
+}
+
 fn install_app(name: &str) -> Result<&'static str, &'static str> {
     let (embedded_name, target) = match name {
         "hello" => ("hello", "/apps/hello"),
         "file-api-test" => ("file_api_test", "/apps/file-api-test"),
+        "file-mutation-test" => ("file_mutation_test", "/apps/file-mutation-test"),
         "tuwaiq-ai" => ("tuwaiq_ai", "/apps/tuwaiq-ai"),
         "tuwaiq-ai-fault" => ("tuwaiq_ai_fault", "/apps/tuwaiq-ai-fault"),
         _ => return Err("unknown provisionable application"),
@@ -629,6 +670,7 @@ fn install_app(name: &str) -> Result<&'static str, &'static str> {
     let bytes = embedded_program(embedded_name).ok_or("embedded bootstrap image missing")?;
     ensure_apps_directory()?;
     vfs::write_file("/", target, bytes)?;
+    ensure_app_data_directory(vfs::basename(target))?;
     Ok(target)
 }
 
@@ -637,7 +679,7 @@ fn handle_install_app(mode: ConsoleMode, args: &str) {
     if name.is_empty() {
         println(
             mode,
-            "Usage: installapp <hello|file-api-test|tuwaiq-ai|tuwaiq-ai-fault>",
+            "Usage: installapp <hello|file-api-test|file-mutation-test|tuwaiq-ai|tuwaiq-ai-fault>",
         );
         return;
     }
@@ -648,6 +690,128 @@ fn handle_install_app(mode: ConsoleMode, args: &str) {
         }
         Err(reason) => print_fs_error(mode, reason),
     }
+}
+
+fn handle_storage_test(mode: ConsoleMode) {
+    let path = match install_app("file-mutation-test") {
+        Ok(path) => path,
+        Err(reason) => {
+            print_fs_error(mode, reason);
+            return;
+        }
+    };
+    let id = match spawn_from_vfs(path, "/") {
+        Ok(id) => id,
+        Err(reason) => {
+            print(mode, "storage: FAIL filesystem-backed spawn: ");
+            println(mode, reason);
+            return;
+        }
+    };
+    wait_for_terminated(id);
+    let exit = task::info(id).ok().and_then(|info| info.exit_code);
+    task::reap_now();
+    println(
+        mode,
+        if exit == Some(0) {
+            "storage: PASS Ring-3 mutation ABI and filesystem-backed ELF"
+        } else {
+            "storage: FAIL Ring-3 mutation process"
+        },
+    );
+}
+
+fn handle_fs_interrupted_write_test(mode: ConsoleMode) {
+    if let Err(reason) = ensure_directory("/data/recovery") {
+        print_fs_error(mode, reason);
+        return;
+    }
+    let path = "/data/recovery/interrupted.txt";
+    let stable = b"stable-before-power-loss";
+    if let Err(reason) = vfs::write_file("/", path, stable) {
+        print_fs_error(mode, reason);
+        return;
+    }
+    if let Err(reason) =
+        vfs::inject_interrupted_write("/", path, b"uncommitted-after-power-loss", 1)
+    {
+        print(mode, "fs-recovery: FAIL injection: ");
+        println(mode, reason);
+        return;
+    }
+    let unchanged = vfs::read_file("/", path)
+        .map(|bytes| bytes.as_ref() == stable)
+        .unwrap_or(false);
+    println(
+        mode,
+        if unchanged {
+            "fs-recovery: PASS interrupted checkpoint rejected; active data unchanged"
+        } else {
+            "fs-recovery: FAIL active data changed after interrupted checkpoint"
+        },
+    );
+}
+
+fn handle_fs_exhaustion_test(mode: ConsoleMode) {
+    if let Err(reason) = ensure_directory("/data/exhaust") {
+        print_fs_error(mode, reason);
+        return;
+    }
+    for path in [
+        "/data/exhaust/a.bin",
+        "/data/exhaust/b.bin",
+        "/data/exhaust/c.bin",
+        "/data/exhaust/sentinel.txt",
+        "/data/exhaust/reused.txt",
+    ] {
+        let _ = vfs::remove("/", path);
+    }
+    if let Err(reason) = vfs::write_file("/", "/data/exhaust/sentinel.txt", b"preserved") {
+        print_fs_error(mode, reason);
+        return;
+    }
+    let mut block = Vec::new();
+    if block
+        .try_reserve_exact(crate::tuwaiqfs::MAX_FILE_SIZE)
+        .is_err()
+    {
+        println(mode, "fs-exhaustion: FAIL allocation");
+        return;
+    }
+    block.resize(crate::tuwaiqfs::MAX_FILE_SIZE, 0xA5);
+    if let Err(reason) = vfs::write_file("/", "/data/exhaust/a.bin", &block) {
+        print_fs_error(mode, reason);
+        return;
+    }
+    block.fill(0x5A);
+    if let Err(reason) = vfs::write_file("/", "/data/exhaust/b.bin", &block) {
+        print_fs_error(mode, reason);
+        return;
+    }
+    block.fill(0x3C);
+    let rejected = matches!(
+        vfs::write_file("/", "/data/exhaust/c.bin", &block),
+        Err("filesystem metadata too large")
+    );
+    let absent = vfs::kind("/", "/data/exhaust/c.bin").is_err();
+    let preserved = vfs::read_file("/", "/data/exhaust/sentinel.txt")
+        .map(|bytes| bytes.as_ref() == b"preserved")
+        .unwrap_or(false);
+    let cleanup = vfs::remove("/", "/data/exhaust/a.bin")
+        .and_then(|()| vfs::remove("/", "/data/exhaust/b.bin"));
+    let reused = cleanup
+        .and_then(|()| vfs::write_file("/", "/data/exhaust/reused.txt", b"space-reused"))
+        .and_then(|()| vfs::read_file("/", "/data/exhaust/reused.txt"))
+        .map(|bytes| bytes.as_ref() == b"space-reused")
+        .unwrap_or(false);
+    println(
+        mode,
+        if rejected && absent && preserved && reused {
+            "fs-exhaustion: PASS atomic rejection preserved prior data and reclaimed space reused"
+        } else {
+            "fs-exhaustion: FAIL atomicity or reuse"
+        },
+    );
 }
 
 fn spawn_from_vfs(path: &str, cwd: &str) -> Result<u32, &'static str> {
@@ -748,7 +912,7 @@ fn handle_vfs_test(mode: ConsoleMode) {
     println(
         mode,
         &format!(
-            "vfs: {} normalized-paths per-process-cwd read-handles filesystem-elf exit-cleanup exit_code={} tasks={}->{} frames={}->{} bump={}->{} heap={}->{}",
+            "vfs: {} mount-table fat32-readonly normalized-paths per-process-cwd read-handles seek filesystem-elf exit-cleanup exit_code={} tasks={}->{} frames={}->{} bump={}->{} heap={}->{}",
             if exit == Some(0) && resources_ok { "PASS" } else { "FAIL" },
             exit.map(i64::from).unwrap_or(-1),
             before.tasks,
@@ -1614,43 +1778,56 @@ fn handle_kill_reap(mode: ConsoleMode, args: &str) {
     );
 }
 
-/// `desktop` -- launches the first real Tuwaiq Desktop (Phase 5, Milestones
-/// 6-8) as a genuine Ring 3 ELF process through exactly the same
-/// `task::spawn_user_process` path `runelf` uses -- no Ring 0 shortcut.
-/// Blocks until the desktop process exits (normally or via a fault trapped
-/// by `interrupts.rs`), then reports its final state, so restarting it is
-/// just running `desktop` again.
+/// Launch the packaged desktop from TuwaiqFS. Exit codes 10 and 11 are explicit
+/// desktop requests to hand foreground ownership to File Manager or Terminal;
+/// after that application exits, the shell relaunches `/apps/desktop` from the
+/// filesystem. Escape returns to the shell.
 fn handle_desktop(mode: ConsoleMode) {
-    let Some(bytes) = embedded_program("desktop") else {
-        println(
-            mode,
-            "desktop: embedded program not available in this build",
-        );
-        return;
-    };
-
     task::reap_now();
     print_desktop_lifecycle_stats("before");
-    match spawn_foreground_process("desktop", bytes) {
-        Ok(id) => {
-            print(mode, "Launching Tuwaiq Desktop as pid ");
-            print_u64(mode, id as u64);
-            println(mode, " (press Esc to exit)...");
-            wait_for_terminated(id);
-            let telemetry = release_desktop_foreground(id);
-            emit_input_telemetry("desktop-release", telemetry);
-            clear_screen(mode);
-            print(mode, "Desktop exited: ");
-            print_process_result(mode, id);
-            task::reap_now();
-            print_desktop_lifecycle_stats("after");
-        }
-        Err(reason) => {
-            print(mode, "Desktop load error: ");
-            println(mode, reason);
-            print_desktop_lifecycle_stats("spawn-failed");
+    let mut next = "/apps/desktop";
+    loop {
+        match run_packaged_foreground(next) {
+            Ok((id, exit)) => {
+                clear_screen(mode);
+                print(mode, "Filesystem application exited: ");
+                print_process_result(mode, id);
+                task::reap_now();
+                match (next, exit) {
+                    ("/apps/desktop", Some(10)) => next = "/apps/file-manager",
+                    ("/apps/desktop", Some(11)) => next = "/apps/terminal",
+                    ("/apps/file-manager" | "/apps/terminal", Some(0)) => next = "/apps/desktop",
+                    ("/apps/desktop", Some(0)) => break,
+                    _ => {
+                        println(mode, "Desktop session stopped after application failure.");
+                        break;
+                    }
+                }
+            }
+            Err(reason) => {
+                print(mode, "Filesystem application load error: ");
+                println(mode, reason);
+                print_desktop_lifecycle_stats("spawn-failed");
+                return;
+            }
         }
     }
+    print_desktop_lifecycle_stats("after");
+}
+
+fn run_packaged_foreground(path: &str) -> Result<(u32, Option<i32>), &'static str> {
+    let bytes = vfs::read_file("/", path)?;
+    if bytes.is_empty() || bytes.len() > vfs::MAX_EXECUTABLE_SIZE {
+        return Err("invalid packaged executable size");
+    }
+    let name = vfs::basename(path);
+    let id = spawn_foreground_process(name, &bytes)?;
+    crate::serial_println!("desktop: packaged launch path={} pid={}", path, id);
+    wait_for_terminated(id);
+    let exit = task::info(id).ok().and_then(|info| info.exit_code);
+    let telemetry = release_desktop_foreground(id);
+    emit_input_telemetry("packaged-app-release", telemetry);
+    Ok((id, exit))
 }
 
 /// Run the desktop and an ordinary Ring 3 peer concurrently. Both are
@@ -1923,12 +2100,19 @@ fn acquire_desktop_foreground(id: u32) {
 /// ownership without an interruptible gap. Otherwise the 100 Hz timer could
 /// run the process between spawn and handoff, causing its first INPUT_POLL to
 /// observe the shell as owner.
-fn spawn_foreground_process(name: &str, bytes: &'static [u8]) -> Result<u32, &'static str> {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let id = task::spawn_user_process(name, bytes)?;
+fn spawn_foreground_process(name: &str, bytes: &[u8]) -> Result<u32, &'static str> {
+    let id = task::spawn_user_process_suspended(name, bytes, "/")?;
+    let activated = x86_64::instructions::interrupts::without_interrupts(|| {
         acquire_desktop_foreground(id);
-        Ok(id)
-    })
+        task::activate_task(id)
+    });
+    if !activated {
+        let _ = release_desktop_foreground(id);
+        let _ = task::kill(id);
+        task::reap_now();
+        return Err("foreground activation failed");
+    }
+    Ok(id)
 }
 
 fn release_desktop_foreground(id: u32) -> crate::input::InputTelemetry {
@@ -2479,7 +2663,7 @@ fn print_help(mode: ConsoleMode) {
     println(mode, "  meminfo | memtest");
     println(
         mode,
-        "  ls [path] | pwd | cd <path> | touch | mkdir | cat | write",
+        "  ls [path] | pwd | cd <path> | mounts | touch | mkdir | cat | write",
     );
     println(mode, "  ps | taskinfo | kill | yield | net status | ping");
     println(mode, "  run <program> | notes | editor");
@@ -2495,7 +2679,11 @@ fn print_help(mode: ConsoleMode) {
         mode,
         "         mmap_nx_fault|post_unmap_fault|mmap_exhaustion|mmap_partial_failure|desktop|desktop_peer>",
     );
-    println(mode, "  installapp <name> | runfs <path> | vfstest");
+    println(
+        mode,
+        "  installapp <name> | runfs <path> | vfstest | storagetest",
+    );
+    println(mode, "  fsinterrupttest | fsexhausttest");
     println(mode, "  aipreviewtest | desktopaitest");
     println(mode, "  isolate [bad_program]");
     println(mode, "  spawnfail <count>");
@@ -2595,6 +2783,7 @@ fn command_names() -> &'static [&'static str] {
         "meminfo",
         "memtest",
         "ls",
+        "mounts",
         "pwd",
         "cd",
         "touch",
@@ -2614,6 +2803,9 @@ fn command_names() -> &'static [&'static str] {
         "runfs",
         "installapp",
         "vfstest",
+        "storagetest",
+        "fsinterrupttest",
+        "fsexhausttest",
         "aipreviewtest",
         "desktopaitest",
         "isolate",
