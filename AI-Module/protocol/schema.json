@@ -31,6 +31,8 @@
             "get_memory_info",
             "get_disk_info",
             "list_processes",
+            "get_network_status",
+            "kill_process",
             "launch_application"
           ],
           "description": "Name of the tool being invoked. Must exactly match one entry in the broker's Tool Registry. Any other value is rejected as unknown_tool."
