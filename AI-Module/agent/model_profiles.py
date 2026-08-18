@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ class RuntimeConfig:
     device: str
     threads: int
     gpu_layers: int
+    timeout_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -54,12 +56,17 @@ class ModelProfile:
         return asdict(self)
 
 
+MODEL_ROOT_ENV = "TUWAIQ_AI_MODEL_ROOT"
+PROFILE_PATH_ENV_PREFIX = "TUWAIQ_AI_MODEL_PATH_"
+DEFAULT_MODEL_DIRECTORY = Path("models/local")
+
+
 BUILTIN_MODEL_PROFILES: dict[str, ModelProfile] = {
     "lite": ModelProfile(
         profile_name="lite",
-        model_id="qwen3.5-4b-instruct",
-        model_path="models/local/qwen3.5-4b-quantized.gguf",
-        runtime=RuntimeConfig(engine="local", device="auto", threads=4, gpu_layers=0),
+        model_id="qwen3.5-4b-instruct-quantized",
+        model_path="qwen3.5-4b-quantized.gguf",
+        runtime=RuntimeConfig(engine="llama.cpp", device="cpu", threads=4, gpu_layers=0, timeout_seconds=20.0),
         quantization=QuantizationConfig(format="gguf", bits=4),
         context=ContextConfig(max_input_tokens=4096, max_output_tokens=512),
         generation=GenerationConfig(temperature=0.2, top_p=0.9, top_k=40),
@@ -67,9 +74,9 @@ BUILTIN_MODEL_PROFILES: dict[str, ModelProfile] = {
     ),
     "default": ModelProfile(
         profile_name="default",
-        model_id="qwen3.5-9b-instruct",
-        model_path="models/local/qwen3.5-9b-quantized.gguf",
-        runtime=RuntimeConfig(engine="local", device="auto", threads=6, gpu_layers=0),
+        model_id="qwen3.5-9b-instruct-quantized",
+        model_path="qwen3.5-9b-quantized.gguf",
+        runtime=RuntimeConfig(engine="llama.cpp", device="cpu", threads=6, gpu_layers=0, timeout_seconds=30.0),
         quantization=QuantizationConfig(format="gguf", bits=4),
         context=ContextConfig(max_input_tokens=8192, max_output_tokens=768),
         generation=GenerationConfig(temperature=0.2, top_p=0.9, top_k=40),
@@ -78,8 +85,8 @@ BUILTIN_MODEL_PROFILES: dict[str, ModelProfile] = {
     "pro": ModelProfile(
         profile_name="pro",
         model_id="qwen3.5-27b-instruct",
-        model_path="models/local/qwen3.5-27b.gguf",
-        runtime=RuntimeConfig(engine="local", device="auto", threads=8, gpu_layers=0),
+        model_path="qwen3.5-27b.gguf",
+        runtime=RuntimeConfig(engine="llama.cpp", device="cpu", threads=8, gpu_layers=0, timeout_seconds=45.0),
         quantization=QuantizationConfig(format="gguf", bits=4),
         context=ContextConfig(max_input_tokens=8192, max_output_tokens=1024),
         generation=GenerationConfig(temperature=0.2, top_p=0.9, top_k=40),
@@ -93,10 +100,14 @@ def _validate_profile(profile: ModelProfile) -> None:
         raise ValueError("model_id must not be empty")
     if not profile.model_path.strip():
         raise ValueError("model_path must not be empty")
+    if not profile.runtime.engine.strip():
+        raise ValueError("runtime.engine must not be empty")
     if profile.runtime.threads <= 0:
         raise ValueError("runtime.threads must be > 0")
     if profile.runtime.gpu_layers < 0:
         raise ValueError("runtime.gpu_layers must be >= 0")
+    if profile.runtime.timeout_seconds <= 0:
+        raise ValueError("runtime.timeout_seconds must be > 0")
     if profile.quantization.bits <= 0:
         raise ValueError("quantization.bits must be > 0")
     if profile.context.max_input_tokens <= 0 or profile.context.max_output_tokens <= 0:
@@ -146,8 +157,18 @@ def load_model_profile(profile: str | ModelProfile | dict[str, Any]) -> ModelPro
     raise TypeError("profile must be a profile name, ModelProfile, or profile dict")
 
 
+def resolve_model_root(root: Path) -> Path:
+    configured_root = os.getenv(MODEL_ROOT_ENV)
+    if configured_root:
+        return Path(configured_root).expanduser().resolve()
+    return (root / DEFAULT_MODEL_DIRECTORY).resolve()
+
+
 def resolve_model_path(profile: ModelProfile, root: Path) -> Path:
+    override = os.getenv(f"{PROFILE_PATH_ENV_PREFIX}{profile.profile_name.upper()}")
+    if override:
+        return Path(override).expanduser().resolve()
     model_path = Path(profile.model_path)
     if model_path.is_absolute():
-        return model_path
-    return (root / model_path).resolve()
+        return model_path.resolve()
+    return (resolve_model_root(root) / model_path).resolve()

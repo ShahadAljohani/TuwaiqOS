@@ -11,7 +11,7 @@ requires touching agent.py, broker_client.py, or the protocol.
        |      |
        |      +-- RuleBasedProvider   (default here: no external deps,
        |      |                        deterministic, used by tests/demo)
-       |      +-- LocalModelProvider  (phase-1 local profile/runtime wiring)
+       |      +-- LocalModelProvider  (local Qwen profile/runtime wiring)
        |      +-- RemoteModelProvider (stub: wire up a hosted API)
        |
        +-- BrokerClient -> Rust broker
@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from local_model_runtime import LocalModelRuntime, NoOpLocalRuntime
+from local_model_runtime import LocalModelRuntime, LocalRuntimeError, QwenLocalRuntime
 from model_profiles import ModelProfile, load_model_profile, resolve_model_path
 from protocol import KNOWN_TOOLS
 
@@ -77,10 +77,10 @@ class ModelProvider(ABC):
 
 
 class LocalModelProvider(ModelProvider):
-    """Phase 1 local-model-ready provider.
+    """Local-model provider for Qwen runtime integration.
 
-    Keeps agent architecture model-agnostic while preserving a testable
-    fallback path until a real local runtime is integrated.
+    Keeps agent architecture model-agnostic while preserving a deterministic
+    fallback path for tool-routing and tests.
     """
 
     def __init__(
@@ -91,40 +91,61 @@ class LocalModelProvider(ModelProvider):
         require_model_file: bool = False,
     ) -> None:
         self.profile = load_model_profile(profile)
-        self.runtime = runtime or NoOpLocalRuntime()
+        self.runtime = runtime or QwenLocalRuntime()
         self._fallback = fallback or RuleBasedProvider()
-        repo_root = Path(__file__).resolve().parent.parent
-        self.runtime.validate(self.profile, root=repo_root)
+        self._repo_root = Path(__file__).resolve().parent.parent
+        self.runtime.validate(self.profile, root=self._repo_root)
         if require_model_file:
-            model_path = resolve_model_path(self.profile, repo_root)
+            model_path = resolve_model_path(self.profile, self._repo_root)
             if not model_path.exists():
                 raise ValueError(f"model file does not exist: {model_path}")
 
+    def initialize(self) -> None:
+        self.runtime.initialize(self.profile, root=self._repo_root)
+
+    def shutdown(self) -> None:
+        self.runtime.shutdown()
+
+    def telemetry(self) -> dict[str, Any]:
+        return self.runtime.telemetry()
+
     def decide(self, user_message: str) -> AgentAction:
-        action = self.runtime.decide(user_message=user_message, profile=self.profile)
+        fallback_action = self._fallback.decide(user_message)
+        if fallback_action.kind == "call_tool":
+            return fallback_action
+        try:
+            action = self.runtime.decide(user_message=user_message, profile=self.profile)
+        except LocalRuntimeError:
+            return fallback_action
         if action is not None:
             return action
-        return self._fallback.decide(user_message)
+        return fallback_action
 
     def explain(self, user_message: str, tool: str, result: dict[str, Any]) -> str:
-        explanation = self.runtime.explain(
-            user_message=user_message,
-            tool=tool,
-            result=result,
-            profile=self.profile,
-        )
+        try:
+            explanation = self.runtime.explain(
+                user_message=user_message,
+                tool=tool,
+                result=result,
+                profile=self.profile,
+            )
+        except LocalRuntimeError:
+            explanation = None
         if explanation is not None:
             return explanation
         return self._fallback.explain(user_message, tool, result)
 
     def explain_error(self, user_message: str, tool: str, error_code: str, error_message: str) -> str:
-        explanation = self.runtime.explain_error(
-            user_message=user_message,
-            tool=tool,
-            error_code=error_code,
-            error_message=error_message,
-            profile=self.profile,
-        )
+        try:
+            explanation = self.runtime.explain_error(
+                user_message=user_message,
+                tool=tool,
+                error_code=error_code,
+                error_message=error_message,
+                profile=self.profile,
+            )
+        except LocalRuntimeError:
+            explanation = None
         if explanation is not None:
             return explanation
         return self._fallback.explain_error(user_message, tool, error_code, error_message)
