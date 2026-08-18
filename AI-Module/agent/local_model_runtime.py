@@ -287,10 +287,22 @@ class QwenLocalRuntime(LocalModelRuntime):
     def decide(self, user_message: str, profile: ModelProfile) -> Any | None:
         if not user_message.strip():
             return None
-        prompt = self._build_prompt(user_message)
+        prompt = self._build_tool_call_prompt(user_message)
         text = self._complete(prompt, profile)
         from model_provider import AgentAction
+        from tool_call_parser import ToolCallError, is_shell_command_attempt, is_tool_call, parse_tool_call
 
+        # If the model emitted a shell command string instead of JSON or NL,
+        # discard it entirely and delegate to the fallback -- never echo it.
+        if is_shell_command_attempt(text):
+            return None
+
+        if is_tool_call(text):
+            try:
+                parsed = parse_tool_call(text)
+                return AgentAction(kind="call_tool", tool=parsed.tool, arguments=parsed.arguments)
+            except ToolCallError:
+                pass  # malformed/invalid tool call; fall through to plain response
         return AgentAction(kind="respond", text=text)
 
     def explain(self, user_message: str, tool: str, result: dict[str, Any], profile: ModelProfile) -> str | None:
@@ -365,6 +377,23 @@ class QwenLocalRuntime(LocalModelRuntime):
     def _build_prompt(self, user_message: str) -> str:
         return (
             f"{self._SYSTEM_PROMPT}\n\n"
+            f"User: {user_message.strip()}\n"
+            "Assistant:"
+        )
+
+    def _build_tool_call_prompt(self, user_message: str) -> str:
+        import json
+
+        from tool_schemas import TOOL_SCHEMAS
+
+        tools_json = json.dumps(TOOL_SCHEMAS, indent=2)
+        return (
+            f"{self._SYSTEM_PROMPT}\n\n"
+            "You have access to the following tools. If the user's request requires\n"
+            "a tool, respond with ONLY a single JSON object (no markdown, no extra text):\n"
+            '{"tool": "<tool_name>", "arguments": {<args>}}\n\n'
+            "If no tool is needed, reply naturally in plain text.\n\n"
+            f"Available tools:\n{tools_json}\n\n"
             f"User: {user_message.strip()}\n"
             "Assistant:"
         )
