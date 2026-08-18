@@ -11,7 +11,7 @@ requires touching agent.py, broker_client.py, or the protocol.
        |      |
        |      +-- RuleBasedProvider   (default here: no external deps,
        |      |                        deterministic, used by tests/demo)
-       |      +-- LocalModelProvider  (stub: wire up llama.cpp/ollama/etc.)
+       |      +-- LocalModelProvider  (phase-1 local profile/runtime wiring)
        |      +-- RemoteModelProvider (stub: wire up a hosted API)
        |
        +-- BrokerClient -> Rust broker
@@ -28,8 +28,11 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
+from local_model_runtime import LocalModelRuntime, NoOpLocalRuntime
+from model_profiles import ModelProfile, load_model_profile, resolve_model_path
 from protocol import KNOWN_TOOLS
 
 
@@ -71,6 +74,60 @@ class ModelProvider(ABC):
         """Turn a tool error into an honest, non-technical explanation for
         the user -- never expose raw error codes or internals to them
         directly; that's what the audit log and logger are for."""
+
+
+class LocalModelProvider(ModelProvider):
+    """Phase 1 local-model-ready provider.
+
+    Keeps agent architecture model-agnostic while preserving a testable
+    fallback path until a real local runtime is integrated.
+    """
+
+    def __init__(
+        self,
+        profile: str | ModelProfile = "default",
+        runtime: LocalModelRuntime | None = None,
+        fallback: ModelProvider | None = None,
+        require_model_file: bool = False,
+    ) -> None:
+        self.profile = load_model_profile(profile)
+        self.runtime = runtime or NoOpLocalRuntime()
+        self._fallback = fallback or RuleBasedProvider()
+        repo_root = Path(__file__).resolve().parent.parent
+        self.runtime.validate(self.profile, root=repo_root)
+        if require_model_file:
+            model_path = resolve_model_path(self.profile, repo_root)
+            if not model_path.exists():
+                raise ValueError(f"model file does not exist: {model_path}")
+
+    def decide(self, user_message: str) -> AgentAction:
+        action = self.runtime.decide(user_message=user_message, profile=self.profile)
+        if action is not None:
+            return action
+        return self._fallback.decide(user_message)
+
+    def explain(self, user_message: str, tool: str, result: dict[str, Any]) -> str:
+        explanation = self.runtime.explain(
+            user_message=user_message,
+            tool=tool,
+            result=result,
+            profile=self.profile,
+        )
+        if explanation is not None:
+            return explanation
+        return self._fallback.explain(user_message, tool, result)
+
+    def explain_error(self, user_message: str, tool: str, error_code: str, error_message: str) -> str:
+        explanation = self.runtime.explain_error(
+            user_message=user_message,
+            tool=tool,
+            error_code=error_code,
+            error_message=error_message,
+            profile=self.profile,
+        )
+        if explanation is not None:
+            return explanation
+        return self._fallback.explain_error(user_message, tool, error_code, error_message)
 
 
 class RuleBasedProvider(ModelProvider):
