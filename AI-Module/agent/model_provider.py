@@ -235,8 +235,7 @@ class RuleBasedProvider(ModelProvider):
         if not result or not result.get("interfaces"):
             return "No network interfaces found."
         lines = [
-            f"{i['name']} ({'up' if i['is_up'] else 'down'}): "
-            f"{i['rx_kbps']:.1f} KB/s in, {i['tx_kbps']:.1f} KB/s out"
+            f"{i['name']}: {i['rx_kbps']:.1f} KB/s in, {i['tx_kbps']:.1f} KB/s out"
             for i in result["interfaces"]
         ]
         return "Network status — " + "; ".join(lines)

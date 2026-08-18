@@ -75,9 +75,55 @@ Result:
 Capped server-side at the top 50 by CPU or memory (broker's choice,
 documented in `architecture.md`) — never an unbounded dump of every PID.
 
+### `get_network_status`
+Result:
+```json
+{
+  "interfaces": [
+    {"name": "eth0", "rx_kbps": 12.4, "tx_kbps": 3.1}
+  ]
+}
+```
+Excludes loopback. **Does not report link/up-down state** — the
+`sysinfo` version this is built on does not expose interface
+administrative state on any platform; an earlier attempt inferred it from
+MAC address and was demonstrably wrong (misreported known-down virtual
+interfaces as up), so the field was removed rather than shipped
+unreliable. See `broker/src/procinfo.rs`'s `network_status` docs for the
+real platform-specific APIs a future implementation would need.
+
 ---
 
 ## Action tools (Phase 1)
+
+### `kill_process`
+
+**Sensitive.** Requires explicit user confirmation on a separate turn
+before the broker is ever called (see `docs/architecture.md`'s
+"Confirmation gate"). The broker additionally enforces its own independent
+protection regardless of what Python claims was confirmed.
+
+Arguments:
+```json
+{ "pid": 4821 }
+```
+
+- `pid` must be a real, currently-running process.
+- pid `1` is refused unconditionally (it is always the system
+  init/supervisor process, on any Unix-like system, regardless of its
+  actual name).
+- A small set of well-known critical process names (`init`, `systemd`,
+  `kernel`, the broker's own name, etc.) is also refused by name — see
+  `PROTECTED_PROCESS_NAMES` in `broker/src/tools.rs`.
+- Sends `SIGTERM` (graceful termination request), not `SIGKILL`.
+
+Result on success:
+```json
+{ "pid": 4821, "name": "firefox", "terminated": true }
+```
+
+Error codes: `invalid_arguments` (missing/wrong-type `pid`), `not_found`
+(no such process), `permission_denied` (protected process).
 
 ### `launch_application`
 
