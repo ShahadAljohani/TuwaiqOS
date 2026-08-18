@@ -110,16 +110,18 @@ class LocalModelProvider(ModelProvider):
         return self.runtime.telemetry()
 
     def decide(self, user_message: str) -> AgentAction:
-        fallback_action = self._fallback.decide(user_message)
-        if fallback_action.kind == "call_tool":
-            return fallback_action
+        # Phase 3: try the Qwen runtime first -- it may emit a structured
+        # tool call or a natural-language response.  Fall back to the
+        # rule-based provider only when the runtime is unavailable or fails.
         try:
             action = self.runtime.decide(user_message=user_message, profile=self.profile)
         except LocalRuntimeError:
-            return fallback_action
+            action = None
+
         if action is not None:
             return action
-        return fallback_action
+
+        return self._fallback.decide(user_message)
 
     def explain(self, user_message: str, tool: str, result: dict[str, Any]) -> str:
         try:

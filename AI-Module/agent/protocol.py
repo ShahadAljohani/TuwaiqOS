@@ -24,6 +24,7 @@ KNOWN_TOOLS = frozenset(
         "get_memory_info",
         "get_disk_info",
         "list_processes",
+        "get_network_status",
         "launch_application",
     }
 )
