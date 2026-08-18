@@ -15,7 +15,7 @@ import sys
 
 from agent import Agent
 from broker_client import BrokerClient
-from model_provider import RuleBasedProvider
+from model_provider import LocalModelProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 def main() -> None:
     print("Tuwaiq AI (prototype) — type 'exit' to quit.\n")
     broker = BrokerClient()
-    model = RuleBasedProvider()
+    model = LocalModelProvider(profile="default")
     agent = Agent(model=model, broker=broker)
 
     try:
@@ -41,6 +41,7 @@ def main() -> None:
             reply = agent.handle(user_input)
             print(f"Tuwaiq: {reply}\n")
     finally:
+        model.shutdown()
         broker.shutdown()
         print("Goodbye.")
 
