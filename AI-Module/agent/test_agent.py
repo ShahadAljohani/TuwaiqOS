@@ -12,6 +12,7 @@ Run: pytest test_agent.py -v
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
 
 import pytest
@@ -21,6 +22,14 @@ from broker_client import BrokerClient, BrokerUnavailableError
 from conversation import Conversation
 from model_provider import ModelProvider, RuleBasedProvider, Step
 from protocol import ToolResponse
+
+
+def _spawn_throwaway_process():
+    """A real, harmless, long-running process to test kill_process
+    against. `sleep` is Unix-only and does not exist on Windows -- using
+    the current Python interpreter itself is genuinely cross-platform,
+    since whatever runs this test suite can always run this."""
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
 
 
 @pytest.fixture
@@ -41,10 +50,6 @@ def agent(broker):
 def test_low_memory_usage_answers_without_chaining_to_processes(agent):
     reply = agent.handle("why is my computer slow?")
     assert "Memory usage" in reply
-    # A real machine's memory usage in CI is not reliably below the 70%
-    # chain threshold, so this only asserts the call succeeded and
-    # produced a memory-based answer -- the *conditional* chaining logic
-    # itself is covered deterministically in test_model_provider.py.
     assert reply
 
 
@@ -77,10 +82,10 @@ def test_reasoning_loop_never_exceeds_max_steps():
 
 
 def test_kill_process_requires_confirmation_before_broker_is_called(agent):
-    proc = subprocess.Popen(["sleep", "120"])
+    proc = _spawn_throwaway_process()
     try:
         agent._conversation.last_process_list = [
-            {"pid": proc.pid, "name": "sleep", "cpu_percent": 5.0, "memory_bytes": 100}
+            {"pid": proc.pid, "name": "python", "cpu_percent": 5.0, "memory_bytes": 100}
         ]
         reply = agent.handle("close it")
         assert "Proceed?" in reply
@@ -91,9 +96,9 @@ def test_kill_process_requires_confirmation_before_broker_is_called(agent):
 
 
 def test_confirmed_kill_actually_terminates_the_process(agent):
-    proc = subprocess.Popen(["sleep", "120"])
+    proc = _spawn_throwaway_process()
     agent._conversation.last_process_list = [
-        {"pid": proc.pid, "name": "sleep", "cpu_percent": 5.0, "memory_bytes": 100}
+        {"pid": proc.pid, "name": "python", "cpu_percent": 5.0, "memory_bytes": 100}
     ]
     agent.handle("close it")
     reply = agent.handle("yes")
@@ -103,10 +108,10 @@ def test_confirmed_kill_actually_terminates_the_process(agent):
 
 
 def test_declined_kill_does_not_terminate_the_process(agent):
-    proc = subprocess.Popen(["sleep", "120"])
+    proc = _spawn_throwaway_process()
     try:
         agent._conversation.last_process_list = [
-            {"pid": proc.pid, "name": "sleep", "cpu_percent": 5.0, "memory_bytes": 100}
+            {"pid": proc.pid, "name": "python", "cpu_percent": 5.0, "memory_bytes": 100}
         ]
         agent.handle("close it")
         reply = agent.handle("no")
@@ -118,10 +123,10 @@ def test_declined_kill_does_not_terminate_the_process(agent):
 
 
 def test_ambiguous_reply_does_not_confirm_or_cancel(agent):
-    proc = subprocess.Popen(["sleep", "120"])
+    proc = _spawn_throwaway_process()
     try:
         agent._conversation.last_process_list = [
-            {"pid": proc.pid, "name": "sleep", "cpu_percent": 5.0, "memory_bytes": 100}
+            {"pid": proc.pid, "name": "python", "cpu_percent": 5.0, "memory_bytes": 100}
         ]
         agent.handle("close it")
         reply = agent.handle("maybe later")
@@ -180,8 +185,6 @@ def test_model_provider_crash_does_not_crash_agent(agent):
         crashy_agent = Agent(model=CrashingProvider(), broker=broker)
         reply = crashy_agent.handle("anything")
         assert "ran into a problem" in reply
-        # Agent must remain usable for the next message, not left in a
-        # broken state by the previous crash.
         reply2 = crashy_agent.handle("anything")
         assert "ran into a problem" in reply2
     finally:
@@ -189,9 +192,6 @@ def test_model_provider_crash_does_not_crash_agent(agent):
 
 
 def test_broker_crash_is_recovered_by_automatic_restart(agent):
-    # Force the broker subprocess to die outright, simulating a real crash
-    # (not a clean shutdown), then verify the *next* call transparently
-    # restarts it rather than failing forever.
     assert agent._broker._proc is None  # not started yet
     first = agent.handle("what is my system info")
     assert "TuwaiqOS" in first or "kernel" in first.lower() or first  # started fine

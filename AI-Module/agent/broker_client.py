@@ -32,7 +32,10 @@ from protocol import ToolRequest, ToolResponse
 
 logger = logging.getLogger("tuwaiq_agent.broker_client")
 
-DEFAULT_BROKER_PATH = Path(__file__).resolve().parent.parent / "broker" / "target" / "debug" / "tuwaiq-agent-broker"
+import platform
+
+_BROKER_BINARY_NAME = "tuwaiq-agent-broker.exe" if platform.system() == "Windows" else "tuwaiq-agent-broker"
+DEFAULT_BROKER_PATH = Path(__file__).resolve().parent.parent / "broker" / "target" / "debug" / _BROKER_BINARY_NAME
 CALL_TIMEOUT_SECONDS = 10.0
 MAX_RESTART_ATTEMPTS = 3
 

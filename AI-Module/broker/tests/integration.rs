@@ -13,11 +13,16 @@ use std::process::{Command, Stdio};
 fn broker_binary_path() -> std::path::PathBuf {
     // `cargo test` places the test binary next to the debug build; the
     // main binary is at target/debug/tuwaiq-agent-broker regardless of
-    // which specific path this test binary itself lives at.
+    // which specific path this test binary itself lives at. On Windows
+    // the executable needs a .exe extension; on Unix it does not.
     let mut path = std::env::current_exe().expect("current_exe");
     path.pop(); // deps/
     path.pop(); // debug/
-    path.push("tuwaiq-agent-broker");
+    if cfg!(windows) {
+        path.push("tuwaiq-agent-broker.exe");
+    } else {
+        path.push("tuwaiq-agent-broker");
+    }
     path
 }
 

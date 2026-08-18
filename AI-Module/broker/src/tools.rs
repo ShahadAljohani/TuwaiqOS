@@ -38,6 +38,7 @@ pub fn get_cpu_info(_args: &serde_json::Value) -> ToolResult {
     }))
 }
 
+
 pub fn get_memory_info(_args: &serde_json::Value) -> ToolResult {
     let mem = procinfo::read_meminfo();
     let used = mem.total_bytes.saturating_sub(mem.available_bytes);
@@ -47,12 +48,12 @@ pub fn get_memory_info(_args: &serde_json::Value) -> ToolResult {
         0.0
     };
 
-    let mut procs = procinfo::list_proc_entries();
-    procs.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
+    let mut procs = procinfo::list_proc_entries(Duration::from_millis(1));
+    procs.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));
     let top_consumers: Vec<_> = procs
         .into_iter()
         .take(5)
-        .map(|p| json!({ "pid": p.pid, "name": p.name, "bytes": p.rss_bytes }))
+        .map(|p| json!({ "pid": p.pid, "name": p.name, "bytes": p.memory_bytes }))
         .collect();
 
     Ok(json!({
@@ -62,6 +63,7 @@ pub fn get_memory_info(_args: &serde_json::Value) -> ToolResult {
         "top_consumers": top_consumers,
     }))
 }
+
 
 pub fn get_disk_info(_args: &serde_json::Value) -> ToolResult {
     let volumes: Vec<_> = procinfo::list_disk_volumes()
@@ -84,41 +86,18 @@ pub fn get_disk_info(_args: &serde_json::Value) -> ToolResult {
 }
 
 pub fn list_processes(_args: &serde_json::Value) -> ToolResult {
-    let before = procinfo::list_proc_entries();
-    std::thread::sleep(CPU_SAMPLE_WINDOW);
-    let after = procinfo::list_proc_entries();
+    let mut procs = procinfo::list_proc_entries(CPU_SAMPLE_WINDOW);
+    procs.sort_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Match processes across the two samples by pid to compute a CPU%
-    // delta; a process present only in one sample (started or exited mid
-    // window) is skipped for this snapshot rather than shown with a
-    // meaningless value.
-    let mut merged: Vec<_> = after
-        .into_iter()
-        .filter_map(|a| {
-            before.iter().find(|b| b.pid == a.pid).map(|b| {
-                let jiffies_delta = a.utime_stime_jiffies.saturating_sub(b.utime_stime_jiffies);
-                // USER_HZ is 100 on effectively all modern Linux systems;
-                // the alternative (calling sysconf(_SC_CLK_TCK)) adds a
-                // libc call for a value that has been 100 in practice for
-                // over a decade, so it is treated as a constant here.
-                let cpu_percent = (jiffies_delta as f64 * 10.0)
-                    / CPU_SAMPLE_WINDOW.as_secs_f64().max(0.001);
-                (a, cpu_percent as f32)
-            })
-        })
-        .collect();
-
-    merged.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-
-    let processes: Vec<_> = merged
+    let processes: Vec<_> = procs
         .into_iter()
         .take(MAX_PROCESSES_RETURNED)
-        .map(|(p, cpu_percent)| {
+        .map(|p| {
             json!({
                 "pid": p.pid,
                 "name": p.name,
-                "cpu_percent": cpu_percent,
-                "memory_bytes": p.rss_bytes,
+                "cpu_percent": p.cpu_percent,
+                "memory_bytes": p.memory_bytes,
             })
         })
         .collect();
@@ -133,7 +112,6 @@ pub fn get_network_status(_args: &serde_json::Value) -> ToolResult {
         .map(|iface| {
             json!({
                 "name": iface.name,
-                "is_up": iface.is_up,
                 "rx_kbps": iface.rx_kbps,
                 "tx_kbps": iface.tx_kbps,
             })
