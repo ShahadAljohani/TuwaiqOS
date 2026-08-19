@@ -7,9 +7,12 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import resource
-from typing import Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from model_profiles import ModelProfile, resolve_model_path
+
+if TYPE_CHECKING:
+    from conversation_context import ConversationContext, ToolResultEntry
 
 
 class LocalRuntimeError(RuntimeError):
@@ -96,6 +99,26 @@ class LocalModelRuntime(ABC):
     @abstractmethod
     def decide(self, user_message: str, profile: ModelProfile) -> Any | None:
         """Return an AgentAction-compatible object or None to delegate."""
+
+    def decide_next(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+        profile: ModelProfile,
+    ) -> Any | None:
+        """Multi-step decision given accumulated results.  Default: delegate."""
+        return self.decide(user_message, profile)
+
+    def synthesize(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+        profile: ModelProfile,
+    ) -> str | None:
+        """Synthesize answer from multiple results.  Default: delegate (None)."""
+        return None
 
     @abstractmethod
     def explain(self, user_message: str, tool: str, result: dict[str, Any], profile: ModelProfile) -> str | None:
@@ -305,6 +328,48 @@ class QwenLocalRuntime(LocalModelRuntime):
                 pass  # malformed/invalid tool call; fall through to plain response
         return AgentAction(kind="respond", text=text)
 
+    def decide_next(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+        profile: ModelProfile,
+    ) -> Any | None:
+        """Multi-step decision: build a prompt that includes already-collected
+        tool results so the model can decide whether to call another tool or
+        produce a final answer."""
+        if not user_message.strip():
+            return None
+        prompt = self._build_multi_step_prompt(user_message, accumulated, context)
+        text = self._complete(prompt, profile)
+        from model_provider import AgentAction
+        from tool_call_parser import ToolCallError, is_shell_command_attempt, is_tool_call, parse_tool_call
+
+        if is_shell_command_attempt(text):
+            return None
+
+        if is_tool_call(text):
+            try:
+                parsed = parse_tool_call(text)
+                return AgentAction(kind="call_tool", tool=parsed.tool, arguments=parsed.arguments)
+            except ToolCallError:
+                pass
+        return AgentAction(kind="respond", text=text)
+
+    def synthesize(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+        profile: ModelProfile,
+    ) -> str | None:
+        """Build a synthesis prompt with all accumulated results and return
+        the model's combined natural-language answer."""
+        if not accumulated:
+            return None
+        prompt = self._build_synthesis_prompt(user_message, accumulated, context)
+        return self._complete(prompt, profile)
+
     def explain(self, user_message: str, tool: str, result: dict[str, Any], profile: ModelProfile) -> str | None:
         prompt = self._build_tool_result_prompt(user_message, tool, result)
         return self._complete(prompt, profile)
@@ -395,6 +460,80 @@ class QwenLocalRuntime(LocalModelRuntime):
             "If no tool is needed, reply naturally in plain text.\n\n"
             f"Available tools:\n{tools_json}\n\n"
             f"User: {user_message.strip()}\n"
+            "Assistant:"
+        )
+
+    def _build_multi_step_prompt(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+    ) -> str:
+        """Prompt for the nth iteration of the agent loop.
+
+        Includes a compact summary of already-collected tool results so the
+        model can decide whether to call another tool or answer now.  Raw
+        telemetry is never dumped verbatim -- only compact summaries.
+        """
+        import json
+
+        from tool_schemas import TOOL_SCHEMAS
+
+        tools_json = json.dumps(TOOL_SCHEMAS, indent=2)
+
+        ctx_prefix = context.build_context_prefix()
+        ctx_section = f"{ctx_prefix}\n\n" if ctx_prefix else ""
+
+        if accumulated:
+            collected_lines = ["Already collected:"]
+            for entry in accumulated:
+                status = "ok" if entry.ok else "error"
+                summary = entry.summary or f"{entry.tool}: {status}"
+                collected_lines.append(f"  - {summary}")
+            collected_section = "\n".join(collected_lines) + "\n\n"
+        else:
+            collected_section = ""
+
+        return (
+            f"{self._SYSTEM_PROMPT}\n\n"
+            f"{ctx_section}"
+            f"{collected_section}"
+            "You have access to the following tools.\n"
+            "If you need more information, respond with ONLY a single JSON tool call:\n"
+            '{"tool": "<tool_name>", "arguments": {<args>}}\n'
+            "If you have enough information to answer the user, reply in plain text.\n\n"
+            f"Available tools:\n{tools_json}\n\n"
+            f"User: {user_message.strip()}\n"
+            "Assistant:"
+        )
+
+    def _build_synthesis_prompt(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+    ) -> str:
+        """Prompt asking the model to synthesize a final answer from all results."""
+        ctx_prefix = context.build_context_prefix()
+        ctx_section = f"{ctx_prefix}\n\n" if ctx_prefix else ""
+
+        results_lines: list[str] = []
+        for entry in accumulated:
+            if entry.ok and entry.result:
+                results_lines.append(f"  - {entry.tool}: {entry.summary or str(entry.result)[:200]}")
+            elif not entry.ok:
+                results_lines.append(f"  - {entry.tool}: error")
+
+        results_section = "Collected data:\n" + "\n".join(results_lines) if results_lines else ""
+
+        return (
+            f"{self._SYSTEM_PROMPT}\n\n"
+            f"{ctx_section}"
+            f"{results_section}\n\n"
+            "Using ONLY the data above (do not invent any values), give a clear,\n"
+            "concise natural-language answer to the user's request.\n"
+            "Distinguish observed data from possible cause and conclusion.\n\n"
+            f"User request: {user_message.strip()}\n"
             "Assistant:"
         )
 
