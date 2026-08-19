@@ -18,9 +18,12 @@ requires touching agent.py, broker_client.py, or the protocol.
 
 `RuleBasedProvider` exists so this whole prototype is runnable and testable
 end-to-end without requiring an API key or a multi-GB local model download --
-it is intentionally simple (keyword/intent matching), not a stand-in for the
-real reasoning model. Swap it for `LocalModelProvider`/`RemoteModelProvider`
-once the real model is wired in; nothing else in the codebase changes.
+it is intentionally simple (keyword/intent matching), not a real language
+model. Swap it for `LocalModelProvider`/`RemoteModelProvider` for actual
+natural-language understanding; nothing else in the codebase changes.
+
+Phase 4 adds `decide_next` and `synthesize` for the multi-step agent loop.
+Both have default implementations here so no existing subclass is broken.
 """
 
 from __future__ import annotations
@@ -29,11 +32,14 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from local_model_runtime import LocalModelRuntime, LocalRuntimeError, QwenLocalRuntime
 from model_profiles import ModelProfile, load_model_profile, resolve_model_path
 from protocol import KNOWN_TOOLS
+
+if TYPE_CHECKING:
+    from conversation_context import ConversationContext, ToolResultEntry
 
 
 @dataclass
@@ -50,11 +56,16 @@ class AgentAction:
 
 
 class ModelProvider(ABC):
-    """Interface every model backend implements. Two responsibilities only:
-    decide what to do next given the conversation, and explain a tool
-    result in natural language. The provider never touches the broker,
-    the OS, or the protocol wire format directly -- it only ever returns
-    an `AgentAction` or a string; `agent.py` does everything else.
+    """Interface every model backend implements.
+
+    Core responsibilities:
+    - `decide`: single-turn tool-or-respond decision (Phase 1-3).
+    - `explain` / `explain_error`: turn a tool result into natural language.
+    - `decide_next`: multi-step loop decision given accumulated results (Ph 4).
+    - `synthesize`: produce a final answer from multiple tool results (Ph 4).
+
+    `decide_next` and `synthesize` have concrete default implementations here
+    so existing subclasses need not change.
     """
 
     @abstractmethod
@@ -74,6 +85,48 @@ class ModelProvider(ABC):
         """Turn a tool error into an honest, non-technical explanation for
         the user -- never expose raw error codes or internals to them
         directly; that's what the audit log and logger are for."""
+
+    # ------------------------------------------------------------------
+    # Phase 4: multi-step loop support (non-abstract; override for richer
+    # behaviour)
+    # ------------------------------------------------------------------
+
+    def decide_next(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+    ) -> AgentAction:
+        """Decide the next action given already-accumulated tool results.
+
+        Default: delegates to `decide(user_message)`, ignoring accumulated
+        results and context.  This preserves Phase 1-3 single-tool behaviour
+        when not overridden.
+        """
+        return self.decide(user_message)
+
+    def synthesize(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+    ) -> str:
+        """Produce a final natural-language answer from multiple tool results.
+
+        Default: explains the last successful result (single-tool fallback),
+        or the last error if nothing succeeded.
+        """
+        if not accumulated:
+            return "I don't have enough information to answer that."
+        best = next((e for e in reversed(accumulated) if e.ok), accumulated[-1])
+        if best.ok:
+            return self.explain(user_message, best.tool, best.result)
+        return self.explain_error(
+            user_message,
+            best.tool,
+            "internal_error",
+            f"tool {best.tool!r} did not return a result",
+        )
 
 
 class LocalModelProvider(ModelProvider):
@@ -122,6 +175,48 @@ class LocalModelProvider(ModelProvider):
             return action
 
         return self._fallback.decide(user_message)
+
+    def decide_next(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+    ) -> AgentAction:
+        try:
+            action = self.runtime.decide_next(
+                user_message=user_message,
+                accumulated=accumulated,
+                context=context,
+                profile=self.profile,
+            )
+        except LocalRuntimeError:
+            action = None
+
+        if action is not None:
+            return action
+
+        return self._fallback.decide_next(user_message, accumulated, context)
+
+    def synthesize(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+    ) -> str:
+        try:
+            result = self.runtime.synthesize(
+                user_message=user_message,
+                accumulated=accumulated,
+                context=context,
+                profile=self.profile,
+            )
+        except LocalRuntimeError:
+            result = None
+
+        if result is not None:
+            return result
+
+        return self._fallback.synthesize(user_message, accumulated, context)
 
     def explain(self, user_message: str, tool: str, result: dict[str, Any]) -> str:
         try:
@@ -183,6 +278,15 @@ class RuleBasedProvider(ModelProvider):
         "files": "file_manager",
     }
 
+    # For "slow/performance" queries the agent collects all four signals
+    # before synthesizing an answer (CPU, memory, process list, disk).
+    _DIAGNOSIS_TOOLS: list[str] = [
+        "get_cpu_info",
+        "get_memory_info",
+        "list_processes",
+        "get_disk_info",
+    ]
+
     def decide(self, user_message: str) -> AgentAction:
         text = user_message.lower().strip()
 
@@ -216,6 +320,75 @@ class RuleBasedProvider(ModelProvider):
                 "What would you like to know?"
             ),
         )
+
+    def decide_next(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+    ) -> AgentAction:
+        """Multi-step decision for the agent loop.
+
+        For performance/diagnosis queries, collects all four signals before
+        synthesizing.  For all other queries, falls back to single-tool
+        `decide` on the first iteration.
+        """
+        text = user_message.lower().strip()
+        is_diagnosis = bool(
+            re.search(r"\bslow\b", text)
+            or re.search(r"\bperformance\b", text)
+            or re.search(r"why.*computer", text)
+            or re.search(r"what.*using.*most", text)
+            or re.search(r"what.*slow", text)
+        )
+
+        called = {e.tool for e in accumulated}
+
+        if is_diagnosis:
+            # Return the next uncalled diagnosis tool, or respond if all done.
+            for tool in self._DIAGNOSIS_TOOLS:
+                if tool not in called:
+                    return AgentAction(kind="call_tool", tool=tool)
+            # All diagnosis tools collected -- signal time to synthesize.
+            return AgentAction(kind="respond", text="")
+
+        # Non-diagnosis: single-tool then respond.
+        if not accumulated:
+            return self.decide(user_message)
+        # Already have a result -- synthesize now.
+        return AgentAction(kind="respond", text="")
+
+    def synthesize(
+        self,
+        user_message: str,
+        accumulated: "list[ToolResultEntry]",
+        context: "ConversationContext",
+    ) -> str:
+        """Combine multiple tool results into one coherent answer."""
+        if not accumulated:
+            return "I don't have enough information to answer that."
+
+        parts: list[str] = []
+        for entry in accumulated:
+            if entry.ok:
+                try:
+                    parts.append(self.explain(user_message, entry.tool, entry.result))
+                except Exception:
+                    pass
+
+        if not parts:
+            return "I wasn't able to retrieve any system information."
+
+        text = user_message.lower()
+        if (
+            re.search(r"\bslow\b", text)
+            or re.search(r"\bperformance\b", text)
+            or re.search(r"why.*computer", text)
+        ):
+            diagnosis = self._diagnose(accumulated)
+            return "\n".join(parts) + (f"\n\n{diagnosis}" if diagnosis else "")
+
+        return "\n".join(parts)
 
     def _match_launch(self, text: str) -> str | None:
         if not any(re.search(p, text) for p in self._LAUNCH_PATTERNS):
@@ -273,3 +446,51 @@ class RuleBasedProvider(ModelProvider):
         if error_code == "internal_error":
             return "Something went wrong talking to the system tools. Please try again in a moment."
         return f"I couldn't complete that: {error_message}"
+
+    # ------------------------------------------------------------------
+    # Diagnosis helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _diagnose(accumulated: "list[ToolResultEntry]") -> str:
+        """Generate a brief conclusion from accumulated diagnosis results."""
+        cpu_pct: float | None = None
+        mem_pct: float | None = None
+        disk_pct: float | None = None
+        top_proc: str | None = None
+
+        for entry in accumulated:
+            if not entry.ok:
+                continue
+            r = entry.result
+            if entry.tool == "get_cpu_info":
+                cpu_pct = float(r.get("usage_percent") or 0)
+            elif entry.tool == "get_memory_info":
+                mem_pct = float(r.get("used_percent") or 0)
+            elif entry.tool == "get_disk_info":
+                vols = r.get("volumes") or []
+                if vols:
+                    disk_pct = max(float(v.get("used_percent") or 0) for v in vols)
+            elif entry.tool == "list_processes":
+                procs = r.get("processes") or []
+                if procs:
+                    top = sorted(procs, key=lambda p: p.get("cpu_percent", 0), reverse=True)
+                    top_proc = top[0].get("name") if top else None
+
+        causes: list[str] = []
+        if cpu_pct is not None and cpu_pct >= 70:
+            causes.append(f"high CPU usage ({cpu_pct:.0f}%)")
+        if mem_pct is not None and mem_pct >= 80:
+            causes.append(f"high memory usage ({mem_pct:.0f}%)")
+        if disk_pct is not None and disk_pct >= 90:
+            causes.append(f"disk nearly full ({disk_pct:.0f}%)")
+
+        if not causes:
+            cause_str = "no single dominant cause was found — the system appears healthy overall"
+        else:
+            cause_str = " and ".join(causes)
+
+        conclusion = f"Likely cause: {cause_str}."
+        if top_proc and causes:
+            conclusion += f" The process '{top_proc}' is the top CPU consumer."
+        return conclusion

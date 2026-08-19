@@ -10,17 +10,28 @@ model provider hallucinated an arbitrary tool name or a shell-command-shaped
 string, it is rejected here, in Python, before it would even reach the
 broker (which independently re-validates it again on the Rust side -- two
 layers, not one, is deliberate; see architecture.md's "Defense in depth").
+
+Phase 4 adds a bounded multi-step agent loop (`handle_with_context`) on top
+of the single-turn foundation.  `handle` (Phase 1–3 public API) is preserved
+as a compatibility wrapper that creates a fresh ephemeral context.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from broker_client import BrokerClient, BrokerUnavailableError
+from conversation_context import ConversationContext, ToolResultEntry
 from model_provider import AgentAction, ModelProvider
 from protocol import KNOWN_TOOLS
 
 logger = logging.getLogger("tuwaiq_agent.agent")
+
+# Maximum number of tool calls the agent loop will make for a single user
+# request.  Prevents runaway loops; 5 is enough for a full system diagnosis
+# (cpu + memory + processes + disk + network if relevant).
+MAX_LOOP_ITERATIONS: int = 5
 
 
 class Agent:
@@ -28,49 +39,167 @@ class Agent:
         self._model = model
         self._broker = broker
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def handle(self, user_message: str) -> str:
-        try:
-            action: AgentAction = self._model.decide(user_message)
-        except Exception:
-            # A crash inside the model/provider layer must not crash the
-            # whole agent process (requirement 15's "AI process crash" case,
-            # tested directly in tests/) -- caught here, at the outermost
-            # orchestration boundary, and turned into a safe user-facing
-            # message instead of propagating.
-            logger.exception("model provider raised while deciding an action")
-            return "Sorry, I ran into a problem understanding that. Could you try again?"
+        """Single-turn handler (Phase 1–3 compatibility).
 
-        if action.kind == "respond":
-            return action.text or ""
+        Creates an ephemeral context for the turn so existing callers and
+        tests need not change.  For multi-turn sessions use
+        `handle_with_context` directly.
+        """
+        return self.handle_with_context(user_message, ConversationContext())
 
-        return self._handle_tool_call(user_message, action)
+    def handle_with_context(
+        self, user_message: str, context: ConversationContext
+    ) -> str:
+        """Multi-step agent loop with bounded iterations.
 
-    def _handle_tool_call(self, user_message: str, action: AgentAction) -> str:
-        tool = action.tool or ""
+        Flow per user request:
+          1. Resolve any pronouns/references ("it", "open it") from context.
+          2. Ask the model what to do next (call a tool or respond).
+          3. If respond → return immediately.
+          4. If call_tool → validate, call broker, update context.
+          5. Repeat from step 2 up to MAX_LOOP_ITERATIONS times.
+          6. After the loop, synthesize a final answer from accumulated results.
 
-        # First enforcement layer: reject anything not in the known,
-        # fixed tool set before it ever reaches the broker process at all.
-        if tool not in KNOWN_TOOLS:
-            logger.warning("model requested unknown tool %r; refusing to call broker", tool)
-            return "I don't have a way to do that yet."
+        Safeguards:
+        - Repeated tool calls are detected and stop the loop.
+        - Unknown tools are rejected before reaching the broker.
+        - Model failures are caught and do not crash the agent.
+        - Broker unavailability surfaces a safe user-facing message.
+        """
+        resolved = context.resolve_references(user_message)
+        context.add_user_turn(user_message)
 
-        try:
-            response = self._broker.call(tool, action.arguments)
-        except BrokerUnavailableError as e:
-            logger.error("broker unavailable: %s", e)
-            return "System tools are temporarily unavailable. Please try again shortly."
+        accumulated: list[ToolResultEntry] = []
+        called_tools: set[str] = set()
 
-        if response.ok:
+        for iteration in range(MAX_LOOP_ITERATIONS):
             try:
-                return self._model.explain(user_message, tool, response.result or {})
+                action = self._model.decide_next(resolved, accumulated, context)
             except Exception:
-                logger.exception("model provider raised while explaining a result")
-                return f"I got a result but had trouble explaining it: {response.result}"
+                logger.exception(
+                    "model provider raised at loop iteration %d; stopping loop", iteration
+                )
+                break
 
-        try:
-            return self._model.explain_error(
-                user_message, tool, response.error_code or "internal_error", response.error_message or ""
+            if action.kind == "respond":
+                text = action.text or ""
+                if text:
+                    # Model provided a complete answer — return it directly.
+                    context.add_assistant_turn(text, accumulated)
+                    return text
+                # Empty text is a synthesize-now signal from the provider.
+                # Break out of the loop so the synthesis path runs below.
+                break
+
+            tool = action.tool or ""
+
+            # Reject unknown tools before the broker ever sees the request.
+            if tool not in KNOWN_TOOLS:
+                logger.warning(
+                    "model requested unknown tool %r at iteration %d; stopping loop",
+                    tool,
+                    iteration,
+                )
+                break
+
+            # Prevent repeated calls to the same tool in one request.
+            if tool in called_tools:
+                logger.warning(
+                    "repeated tool call to %r at iteration %d; stopping loop",
+                    tool,
+                    iteration,
+                )
+                break
+
+            called_tools.add(tool)
+
+            try:
+                response = self._broker.call(tool, action.arguments)
+            except BrokerUnavailableError as exc:
+                logger.error("broker unavailable: %s", exc)
+                text = "System tools are temporarily unavailable. Please try again shortly."
+                context.add_assistant_turn(text, accumulated)
+                return text
+
+            entry = ToolResultEntry(
+                tool=tool,
+                result=response.result or {},
+                ok=response.ok,
+                summary=self._summarize_result(tool, response.result, response.ok),
             )
-        except Exception:
-            logger.exception("model provider raised while explaining an error")
-            return "I couldn't complete that request."
+            accumulated.append(entry)
+            context.update_entity_from_tool_result(tool, response.result or {})
+
+        # Loop finished (max iterations, repeated tool, or break).
+        # Synthesize a final answer from whatever we collected.
+        if accumulated:
+            try:
+                text = self._model.synthesize(resolved, accumulated, context)
+                context.add_assistant_turn(text, accumulated)
+                return text
+            except Exception:
+                logger.exception("model provider raised during synthesize")
+                # Fall through to plain concatenation below.
+                text = self._fallback_synthesize(resolved, accumulated)
+                context.add_assistant_turn(text, accumulated)
+                return text
+
+        text = "I wasn't able to gather enough information to answer that."
+        context.add_assistant_turn(text, [])
+        return text
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _summarize_result(
+        tool: str, result: dict[str, Any] | None, ok: bool
+    ) -> str:
+        """Build a compact one-line summary of a tool result for context injection."""
+        if not ok or result is None:
+            return f"{tool}: error"
+        if tool == "get_cpu_info":
+            return f"CPU {result.get('usage_percent', '?')}% across {result.get('core_count', '?')} cores"
+        if tool == "get_memory_info":
+            pct = result.get("used_percent", "?")
+            top = (result.get("top_consumers") or [{}])[0].get("name", "")
+            return f"RAM {pct}% used" + (f", top: {top}" if top else "")
+        if tool == "get_disk_info":
+            vols = result.get("volumes") or []
+            parts = [f"{v.get('mount_point','?')} {v.get('used_percent','?')}%" for v in vols[:2]]
+            return "Disk: " + ", ".join(parts) if parts else "Disk: no volumes"
+        if tool == "list_processes":
+            procs = result.get("processes") or []
+            if procs:
+                top = sorted(procs, key=lambda p: p.get("cpu_percent", 0), reverse=True)
+                return f"Top process: {top[0].get('name','?')} ({top[0].get('cpu_percent','?')}% CPU)"
+            return "processes: none"
+        if tool == "get_network_status":
+            ifaces = result.get("interfaces") or []
+            names = [i.get("name", "?") for i in ifaces[:2]]
+            return "Network: " + ", ".join(names) if names else "Network: no interfaces"
+        if tool == "get_system_info":
+            return f"OS: {result.get('os_name','?')} {result.get('os_version','?')}"
+        if tool == "launch_application":
+            return f"Launched {result.get('app_id','?')} (pid {result.get('pid','?')})"
+        return f"{tool}: ok"
+
+    def _fallback_synthesize(
+        self, user_message: str, accumulated: list[ToolResultEntry]
+    ) -> str:
+        """Plain fallback when the model synthesize call fails."""
+        parts: list[str] = []
+        for entry in accumulated:
+            if entry.ok and entry.summary:
+                parts.append(entry.summary)
+            elif not entry.ok:
+                parts.append(f"{entry.tool}: error")
+        if parts:
+            return "Here is what I found: " + "; ".join(parts) + "."
+        return "I couldn't retrieve the requested information."
