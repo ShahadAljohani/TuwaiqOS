@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -47,6 +48,23 @@ class InsufficientMemoryError(ModelLoadError):
     """Raised when the runtime cannot allocate enough memory."""
 
 
+class InsufficientRAMError(InsufficientMemoryError):
+    """Raised when the system does not have enough RAM to load the model."""
+
+
+class InsufficientVRAMError(InsufficientMemoryError):
+    """Raised when the system does not have enough VRAM for GPU-accelerated inference."""
+
+
+class ModelProcessState(enum.Enum):
+    """Lifecycle state of the local model runtime."""
+
+    UNLOADED = "unloaded"
+    LOADING = "loading"
+    READY = "ready"
+    CRASHED = "crashed"
+
+
 @dataclass
 class LocalRuntimeTelemetry:
     loaded: bool = False
@@ -61,6 +79,7 @@ class LocalRuntimeTelemetry:
     gpu_usage_percent: float | None = None
     last_error_kind: str | None = None
     last_error_message: str | None = None
+    process_state: str = ModelProcessState.UNLOADED.value
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -258,9 +277,11 @@ class QwenLocalRuntime(LocalModelRuntime):
         model_path = resolve_model_path(profile, root=root)
         if not model_path.exists():
             self._record_error("missing_model", f"model file does not exist: {model_path}")
+            self._set_process_state(ModelProcessState.CRASHED)
             raise MissingModelError(f"model file does not exist: {model_path}")
         if not model_path.is_file():
             self._record_error("invalid_model_path", f"model path is not a file: {model_path}")
+            self._set_process_state(ModelProcessState.CRASHED)
             raise InvalidModelPathError(f"model path is not a file: {model_path}")
         if (
             self._backend is not None
@@ -269,21 +290,28 @@ class QwenLocalRuntime(LocalModelRuntime):
         ):
             return
 
+        # Phase 5: check system resources before attempting to load.
+        self._check_resources(profile)
+
         self.shutdown()
+        self._set_process_state(ModelProcessState.LOADING)
         started = self._snapshot()
         started_at = time.perf_counter()
         try:
             self._backend = self._backend_factory(model_path, profile)
         except LocalRuntimeError as exc:
             self._record_error(self._error_kind_for_exception(exc), str(exc))
+            self._set_process_state(ModelProcessState.CRASHED)
             raise
         except MemoryError as exc:
             wrapped = InsufficientMemoryError("insufficient memory while loading the local Qwen model")
             self._record_error("insufficient_memory", str(wrapped))
+            self._set_process_state(ModelProcessState.CRASHED)
             raise wrapped from exc
         except Exception as exc:
             wrapped = ModelLoadError(f"failed to load local model from {model_path}")
             self._record_error("model_loading_failure", str(wrapped))
+            self._set_process_state(ModelProcessState.CRASHED)
             raise wrapped from exc
 
         self._loaded_profile = profile
@@ -295,6 +323,7 @@ class QwenLocalRuntime(LocalModelRuntime):
         self._telemetry.load_duration_ms = (time.perf_counter() - started_at) * 1000.0
         self._update_metrics(started)
         self._clear_error()
+        self._set_process_state(ModelProcessState.READY)
 
     def shutdown(self) -> None:
         if self._backend is not None:
@@ -303,6 +332,17 @@ class QwenLocalRuntime(LocalModelRuntime):
         self._loaded_profile = None
         self._root = None
         self._telemetry.loaded = False
+        self._set_process_state(ModelProcessState.UNLOADED)
+
+    def restart(self, profile: ModelProfile, root: Path) -> None:
+        """Shut down the current backend (if any) and re-initialize.
+
+        Useful for recovering from a crashed/hung runtime without restarting
+        the whole Python agent or TuwaiqOS.  The broker is never touched
+        during this operation.
+        """
+        self.shutdown()
+        self.initialize(profile, root)
 
     def telemetry(self) -> dict[str, Any]:
         return self._telemetry.to_dict()
@@ -419,17 +459,27 @@ class QwenLocalRuntime(LocalModelRuntime):
             self._telemetry.inference_latency_ms = (time.perf_counter() - started_at) * 1000.0
             self._update_metrics(started)
             self._record_error("timeout", "local Qwen inference timed out")
+            self._set_process_state(ModelProcessState.CRASHED)
             raise InferenceTimeoutError("local Qwen inference timed out") from exc
         except LocalRuntimeError as exc:
             self._telemetry.inference_latency_ms = (time.perf_counter() - started_at) * 1000.0
             self._update_metrics(started)
             self._record_error(self._error_kind_for_exception(exc), str(exc))
+            self._set_process_state(ModelProcessState.CRASHED)
             raise
+        except MemoryError as exc:
+            self._telemetry.inference_latency_ms = (time.perf_counter() - started_at) * 1000.0
+            self._update_metrics(started)
+            wrapped = InsufficientMemoryError("OOM during inference")
+            self._record_error("oom", str(wrapped))
+            self._set_process_state(ModelProcessState.CRASHED)
+            raise wrapped from exc
         except Exception as exc:
             self._telemetry.inference_latency_ms = (time.perf_counter() - started_at) * 1000.0
             self._update_metrics(started)
             wrapped = InferenceError("local Qwen inference failed")
             self._record_error("inference_failure", str(wrapped))
+            self._set_process_state(ModelProcessState.CRASHED)
             raise wrapped from exc
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -437,6 +487,10 @@ class QwenLocalRuntime(LocalModelRuntime):
         self._telemetry.inference_latency_ms = (time.perf_counter() - started_at) * 1000.0
         self._update_metrics(started)
         self._clear_error()
+        # Restore READY state after successful inference (may have been
+        # CRASHED from a previous failed inference attempt that was recovered).
+        if self._telemetry.loaded:
+            self._set_process_state(ModelProcessState.READY)
         return text
 
     def _build_prompt(self, user_message: str) -> str:
@@ -584,6 +638,30 @@ class QwenLocalRuntime(LocalModelRuntime):
         self._telemetry.last_error_kind = None
         self._telemetry.last_error_message = None
 
+    def _set_process_state(self, state: ModelProcessState) -> None:
+        self._telemetry.process_state = state.value
+
+    def _check_resources(self, profile: ModelProfile) -> None:
+        """Pre-flight RAM/VRAM check.  Raises InsufficientRAMError /
+        InsufficientVRAMError when the system clearly cannot satisfy the
+        profile's minimum requirements.  Silently passes when measurement
+        is unavailable so as not to false-positive on CI or unusual envs.
+        """
+        from resource_manager import check_ram_for_profile, check_vram_for_profile
+
+        ram_ok, ram_msg = check_ram_for_profile(profile.hardware.min_ram_gb)
+        if not ram_ok:
+            self._record_error("insufficient_ram", ram_msg)
+            self._set_process_state(ModelProcessState.CRASHED)
+            raise InsufficientRAMError(ram_msg)
+
+        if profile.runtime.gpu_layers > 0:
+            vram_ok, vram_msg = check_vram_for_profile(profile.hardware.min_vram_gb)
+            if not vram_ok:
+                self._record_error("insufficient_vram", vram_msg)
+                self._set_process_state(ModelProcessState.CRASHED)
+                raise InsufficientVRAMError(vram_msg)
+
     def _cpu_seconds(self) -> float:
         usage = resource.getrusage(resource.RUSAGE_SELF)
         return usage.ru_utime + usage.ru_stime
@@ -602,6 +680,10 @@ class QwenLocalRuntime(LocalModelRuntime):
             return "invalid_model_path"
         if isinstance(exc, IncompatibleRuntimeError):
             return "incompatible_runtime"
+        if isinstance(exc, InsufficientRAMError):
+            return "insufficient_ram"
+        if isinstance(exc, InsufficientVRAMError):
+            return "insufficient_vram"
         if isinstance(exc, InsufficientMemoryError):
             return "insufficient_memory"
         if isinstance(exc, InferenceTimeoutError):
