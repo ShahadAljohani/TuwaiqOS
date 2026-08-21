@@ -73,6 +73,29 @@ mod tests {
         let result = dispatch("get_network_status", &json!({}));
         assert!(result.is_ok());
     }
+	    #[test]
+    fn close_application_without_app_id_is_invalid_arguments() {
+        let result = dispatch("close_application", &json!({}));
+        assert!(result.is_err());
+        let (code, _) = result.unwrap_err();
+        assert_eq!(code, ErrorCode::InvalidArguments);
+    }
+
+    #[test]
+    fn close_application_unknown_app_is_not_allowlisted() {
+        let result = dispatch("close_application", &json!({"app_id": "totally_fake"}));
+        assert!(result.is_err());
+        let (code, _) = result.unwrap_err();
+        assert_eq!(code, ErrorCode::NotAllowlisted);
+    }
+
+    #[test]
+    fn close_application_valid_but_not_running_is_not_found() {
+        let result = dispatch("close_application", &json!({"app_id": "vscode"}));
+        assert!(result.is_err());
+        let (code, _) = result.unwrap_err();
+        assert_eq!(code, ErrorCode::NotFound);
+    }
 
     #[test]
     fn kill_process_refuses_pid_1_unconditionally() {

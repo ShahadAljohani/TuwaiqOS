@@ -178,6 +178,43 @@ pub fn kill_process(args: &serde_json::Value) -> ToolResult {
     }
 }
 
+pub fn close_application(args: &serde_json::Value) -> ToolResult {
+    let app_id = args
+        .get("app_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                ErrorCode::InvalidArguments,
+                "close_application requires a string 'app_id' argument".to_string(),
+            )
+        })?;
+
+    let expected_name = allowlist::expected_process_name(app_id)
+        .ok_or_else(|| {
+            (
+                ErrorCode::NotAllowlisted,
+                format!("'{app_id}' is not an allowlisted application"),
+            )
+        })?
+        .to_lowercase();
+
+    let running = procinfo::list_proc_entries(Duration::from_millis(1));
+    let target = running
+        .into_iter()
+        .find(|p| p.name.to_lowercase() == expected_name)
+        .ok_or_else(|| {
+            (
+                ErrorCode::NotFound,
+                format!("'{app_id}' does not appear to be running"),
+            )
+        })?;
+
+    match procinfo::terminate_process(target.pid) {
+        Ok(()) => Ok(json!({ "app_id": app_id, "pid": target.pid, "name": target.name, "terminated": true })),
+        Err(reason) => Err((ErrorCode::InternalError, reason.to_string())),
+    }
+}
+
 pub fn launch_application(args: &serde_json::Value) -> ToolResult {
     let app_id = args
         .get("app_id")

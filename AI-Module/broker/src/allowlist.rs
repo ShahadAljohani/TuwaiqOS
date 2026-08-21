@@ -75,3 +75,18 @@ pub fn lookup(app_id: &str) -> Option<&'static AppEntry> {
     ALLOWLIST.iter().find(|entry| entry.app_id == app_id)
 }
 
+/// Derives the expected running-process name from an allowlisted app's
+/// binary filename, e.g. `/usr/bin/firefox` -> `"firefox"`. This is an
+/// approximation: a real running process's reported name doesn't always
+/// exactly match its binary's filename (packaging/platform differences),
+/// which is why `close_application` in tools.rs matches case-insensitively
+/// and treats this as a filter, not a guaranteed-unique lookup.
+pub fn expected_process_name(app_id: &str) -> Option<&'static str> {
+    lookup(app_id).map(|entry| {
+        entry
+            .binary_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(entry.binary_path)
+    })
+}

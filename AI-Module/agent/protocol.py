@@ -26,6 +26,7 @@ KNOWN_TOOLS = frozenset(
         "list_processes",
         "get_network_status",
         "kill_process",
+        "close_application",
         "launch_application",
     }
 )

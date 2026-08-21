@@ -85,6 +85,38 @@ pub fn process_name_for_pid(pid: u32) -> Option<String> {
         .map(|p| p.name().to_string_lossy().to_string())
 }
 
+pub fn find_processes_by_name(name: &str) -> Vec<(u32, String)> {
+    let target = normalize_process_name(name);
+
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    sys.processes()
+        .values()
+        .filter_map(|process| {
+            let process_name = process.name().to_string_lossy().to_string();
+
+            if normalize_process_name(&process_name) == target {
+                Some((process.pid().as_u32(), process_name))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn normalize_process_name(name: &str) -> String {
+    let name = name.trim().to_lowercase();
+
+    if cfg!(windows) {
+        name.strip_suffix(".exe")
+            .unwrap_or(&name)
+            .to_string()
+    } else {
+        name
+    }
+}
+
 /// Request graceful termination. `sysinfo::Process::kill()` sends SIGTERM
 /// on Unix and calls `TerminateProcess` on Windows -- the closest
 /// cross-platform equivalent to "ask it to stop," abstracting away the

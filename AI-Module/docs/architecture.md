@@ -95,8 +95,8 @@ message rather than continuing indefinitely.
 
 ## Confirmation gate
 
-`SENSITIVE_TOOLS` (currently just `kill_process`) never executes on the
-turn it's requested. Instead:
+`SENSITIVE_TOOLS` (currently `kill_process` and `close_application`) never executes on the turn it's requested. Instead:
+
 
 1. `Agent` asks the provider for a description
    (`describe_sensitive_action`) — deliberately a separate, narrow method
@@ -127,6 +127,10 @@ pid 1 and a small set of critical process names *unconditionally*,
 regardless of whether Python claims the user confirmed. A test
 (`test_broker_independently_refuses_pid_1_even_if_confirmed`) verifies this
 specifically — a "confirmed" request for a protected pid is still denied.
+
+`close_application` is also protected by the Python confirmation gate,
+so closing an approved application requires explicit user confirmation
+before the broker is called.
 
 ## Known limitations
 

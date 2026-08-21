@@ -45,7 +45,7 @@ MAX_STEPS = 5
 # confirmation on a separate turn before the broker is ever called. This
 # set is intentionally small, hand-maintained, and independent of anything
 # the model or broker themselves claim about a tool's sensitivity.
-SENSITIVE_TOOLS = frozenset({"kill_process"})
+SENSITIVE_TOOLS = frozenset({"kill_process", "close_application"})
 
 _AFFIRMATIVE = {"yes", "y", "confirm", "proceed", "ok", "okay", "نعم", "أيوه", "تمام"}
 _NEGATIVE = {"no", "n", "cancel", "stop", "لا", "الغاء", "إلغاء"}
@@ -114,6 +114,9 @@ class Agent:
             name = (response.result or {}).get("name", "the process")
             pid = (response.result or {}).get("pid")
             return f"Closed {name} (pid {pid})."
+        if pending.tool == "close_application":
+            app_id = (response.result or {}).get("app_id", "the application")
+            return f"Closed {app_id}."
         return f"Done: {response.result}"
 
     # --- main reasoning loop --------------------------------------------

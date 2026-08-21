@@ -33,6 +33,7 @@
             "list_processes",
             "get_network_status",
             "kill_process",
+	    "close_application",
             "launch_application"
           ],
           "description": "Name of the tool being invoked. Must exactly match one entry in the broker's Tool Registry. Any other value is rejected as unknown_tool."

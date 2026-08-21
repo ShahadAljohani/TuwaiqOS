@@ -35,11 +35,13 @@ pub fn dispatch(tool: &str, arguments: &serde_json::Value) -> tools::ToolResult 
             tools::get_network_status(arguments)
         }
         "kill_process" => tools::kill_process(arguments),
+        "close_application" => tools::close_application(arguments),
         "launch_application" => tools::launch_application(arguments),
         _ => Err((
             ErrorCode::UnknownTool,
             format!("'{tool}' is not a registered tool"),
         )),
+
     }
 }
 

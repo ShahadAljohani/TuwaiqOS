@@ -50,10 +50,8 @@ class Step:
     """One decision from the model within a single turn's reasoning loop."""
 
     kind: Literal["tool_call", "final_answer"]
-    # Present when kind == "tool_call":
     tool: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
-    # Present when kind == "final_answer":
     text: str | None = None
 
 
@@ -67,20 +65,12 @@ class ModelProvider(ABC):
 
     @abstractmethod
     def step(self, user_message: str, conversation: Conversation) -> Step:
-        """Decide the next step for the turn currently being handled.
-        Called once before any tool call (with `current_turn_steps`
-        empty), then again after each tool result, until it returns a
-        `final_answer` step or `Agent.MAX_STEPS` is reached."""
+        """Decide the next step for the turn currently being handled."""
 
     @abstractmethod
     def describe_sensitive_action(self, tool: str, arguments: dict[str, Any]) -> str:
         """Produce the natural-language description shown to the user
-        *before* a sensitive action executes (see agent.py's
-        SENSITIVE_TOOLS gate). Deliberately a separate, narrow method
-        rather than folded into `step()`'s free-form reasoning: the
-        confirmation text is safety-relevant and benefits from staying
-        simple and predictable rather than emerging from open-ended model
-        output."""
+        *before* a sensitive action executes."""
 
 
 class RuleBasedProvider(ModelProvider):
@@ -113,8 +103,10 @@ class RuleBasedProvider(ModelProvider):
         text = user_message.lower().strip()
         already_called = {s.tool for s in conversation.current_turn_steps}
 
-        # --- Close/kill a process, including pronoun resolution ---
         if any(re.search(p, text) for p in self._CLOSE_PATTERNS):
+            app_id = self._match_app_alias(text)
+            if app_id is not None:
+                return Step(kind="tool_call", tool="close_application", arguments={"app_id": app_id})
             pid = self._resolve_target_pid(text, conversation)
             if pid is not None:
                 return Step(kind="tool_call", tool="kill_process", arguments={"pid": pid})
@@ -123,40 +115,42 @@ class RuleBasedProvider(ModelProvider):
                 text="Which process would you like me to close? You can ask me to list processes first.",
             )
 
-        # --- Launch an application ---
         launch_app = self._match_launch(text)
         if launch_app is not None:
             return Step(kind="tool_call", tool="launch_application", arguments={"app_id": launch_app})
 
-        # --- Process listing ---
         if any(re.search(p, text) for p in self._PROCESS_PATTERNS):
             if "list_processes" not in already_called:
                 return Step(kind="tool_call", tool="list_processes")
             return Step(kind="final_answer", text=self._explain_processes(conversation))
 
-        # --- Network ---
         if any(re.search(p, text) for p in self._NETWORK_PATTERNS):
             if "get_network_status" not in already_called:
                 return Step(kind="tool_call", tool="get_network_status")
             return Step(kind="final_answer", text=self._explain_network(conversation))
 
-        # --- Disk ---
         if any(re.search(p, text) for p in self._DISK_PATTERNS):
             if "get_disk_info" not in already_called:
                 return Step(kind="tool_call", tool="get_disk_info")
             return Step(kind="final_answer", text=self._explain_disk(conversation))
 
-        # --- General performance ("why is my computer slow") ---
-        # Chains up to two tool calls in one turn -- memory first, then
-        # processes -- before answering, demonstrating the multi-step loop
-        # rather than being limited to a single tool per turn.
         if any(re.search(p, text) for p in self._PERFORMANCE_PATTERNS):
+            if "get_cpu_info" not in already_called:
+                return Step(kind="tool_call", tool="get_cpu_info")
+
             if "get_memory_info" not in already_called:
                 return Step(kind="tool_call", tool="get_memory_info")
-            memory_result = self._last_result(conversation, "get_memory_info")
-            if memory_result and memory_result.get("used_percent", 0) > 70 and "list_processes" not in already_called:
+
+            if "get_disk_info" not in already_called:
+                return Step(kind="tool_call", tool="get_disk_info")
+
+            if "list_processes" not in already_called:
                 return Step(kind="tool_call", tool="list_processes")
-            return Step(kind="final_answer", text=self._explain_performance(conversation))
+
+            return Step(
+                kind="final_answer",
+                text=self._explain_performance(conversation),
+            )
 
         if any(re.search(p, text) for p in self._PRONOUN_PATTERNS) and conversation.top_process():
             top = conversation.top_process()
@@ -182,9 +176,9 @@ class RuleBasedProvider(ModelProvider):
     def describe_sensitive_action(self, tool: str, arguments: dict[str, Any]) -> str:
         if tool == "kill_process":
             return f"This will close process pid {arguments.get('pid')}. Proceed?"
+        if tool == "close_application":
+            return f"This will close {arguments.get('app_id')}. Proceed?"
         return f"This will run '{tool}' with {arguments}. Proceed?"
-
-    # --- helpers -----------------------------------------------------
 
     def _resolve_target_pid(self, text: str, conversation: Conversation) -> int | None:
         explicit_pid = re.search(r"\bpid\s+(\d+)\b", text)
@@ -199,6 +193,9 @@ class RuleBasedProvider(ModelProvider):
     def _match_launch(self, text: str) -> str | None:
         if not any(re.search(p, text) for p in self._LAUNCH_PATTERNS):
             return None
+        return self._match_app_alias(text)
+
+    def _match_app_alias(self, text: str) -> str | None:
         for alias, app_id in self._APP_ALIASES.items():
             if alias in text:
                 return app_id
@@ -211,15 +208,41 @@ class RuleBasedProvider(ModelProvider):
         return None
 
     def _explain_performance(self, conversation: Conversation) -> str:
+        cpu = self._last_result(conversation, "get_cpu_info")
         mem = self._last_result(conversation, "get_memory_info")
-        if not mem:
-            return "I wasn't able to read memory info."
-        pct = mem.get("used_percent", 0)
-        parts = [f"Memory usage is at {pct:.1f}%."]
+        disk = self._last_result(conversation, "get_disk_info")
         procs = self._last_result(conversation, "list_processes")
+
+        if not any((cpu, mem, disk, procs)):
+            return "I wasn't able to collect enough system data to diagnose the slowdown."
+
+        parts = []
+
+        if cpu:
+            cpu_usage = cpu.get("usage_percent", 0)
+            parts.append(f"CPU usage is at {cpu_usage:.1f}%.")
+
+        if mem:
+            memory_usage = mem.get("used_percent", 0)
+            parts.append(f"Memory usage is at {memory_usage:.1f}%.")
+
+        if disk and disk.get("volumes"):
+            highest_disk = max(
+                disk["volumes"],
+                key=lambda volume: volume.get("used_percent", 0),
+            )
+            parts.append(
+                f"{highest_disk.get('mount_point', 'The disk')} "
+                f"is {highest_disk.get('used_percent', 0):.1f}% full."
+            )
+
         if procs and procs.get("processes"):
             top = procs["processes"][0]
-            parts.append(f"The top consumer right now is {top['name']} ({top['cpu_percent']:.1f}% CPU).")
+            parts.append(
+                f"The top CPU consumer is {top['name']} "
+                f"(pid {top['pid']}, {top['cpu_percent']:.1f}% CPU)."
+            )
+
         return " ".join(parts)
 
     def _explain_processes(self, conversation: Conversation) -> str:
