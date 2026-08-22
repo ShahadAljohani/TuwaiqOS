@@ -11,19 +11,33 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
 fn broker_binary_path() -> std::path::PathBuf {
-    // `cargo test` places the test binary next to the debug build; the
-    // main binary is at target/debug/tuwaiq-agent-broker regardless of
-    // which specific path this test binary itself lives at. On Windows
-    // the executable needs a .exe extension; on Unix it does not.
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop(); // deps/
-    path.pop(); // debug/
-    if cfg!(windows) {
-        path.push("tuwaiq-agent-broker.exe");
+    let current = std::env::current_exe().expect("current_exe");
+
+    let binary_name = if cfg!(windows) {
+        "tuwaiq-agent-broker.exe"
     } else {
-        path.push("tuwaiq-agent-broker");
+        "tuwaiq-agent-broker"
+    };
+
+    let mut dir = current.parent().expect("test executable has no parent");
+
+    loop {
+        let candidate = dir.join(binary_name);
+
+        if candidate.exists() {
+            return candidate;
+        }
+
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
     }
-    path
+
+    panic!(
+        "broker binary not found starting from {:?}; run `cargo build` first",
+        current
+    );
 }
 
 #[test]
