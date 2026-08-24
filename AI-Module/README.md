@@ -65,3 +65,19 @@ python -m pytest test_schema_conformance.py -v   # schema validation against the
 
 Both suites run against the real compiled binary and real `/proc` data —
 nothing here is mocked.
+
+## Phase 6 validation runner
+
+Run the local LLM validation/benchmarking report generator from `AI-Module/`:
+
+```bash
+python agent/phase6_validation.py
+```
+
+It writes:
+
+- `evaluation/reports/phase6_local_llm_validation.md`
+- `evaluation/benchmarks/phase6_local_llm_validation.json`
+
+If a required model file is unavailable, the report records the model as `not_run`
+instead of inventing benchmark results.
