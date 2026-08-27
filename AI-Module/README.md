@@ -1,83 +1,121 @@
-# tuwaiq-telemetry-provider
+# Tuwaiq AI Module
 
-Stage 1 (per `ai_development/docs/INTEGRATION.md`'s staging) System
-Telemetry Provider. Emits one JSON object on stdout, built entirely from
-real host `/proc` data, that conforms to
-`ai_development/system_interface/schemas/telemetry_input.schema.json`.
+Local-first Tuwaiq AI prototype for `ibraman5/TuwaiqOS`.
 
-This is the piece the integration guide calls "future integration
-requirement" — it now exists, is read-only, and its output has been
-verified (see `test_schema_conformance.py`) against the exact schema
-already checked into the repo.
+## Current architecture
 
-## Build
-
-```
-cd telemetry-provider
-cargo build
-```
-
-## Run standalone
-
-```
-./target/debug/tuwaiq-telemetry-provider
-```
-
-Prints one schema-conforming JSON object and exits. Takes ~1.5 seconds
-(three ~500ms sampling windows for CPU/disk/network rate metrics).
-
-## Feed it into the existing inference pipeline
-
-This is the actual round-trip the task asks for: real telemetry → the
-already-implemented Isolation Forest model → a real anomaly result.
-
-```
-./target/debug/tuwaiq-telemetry-provider > /tmp/live_snapshot.json
-cd ../ai_development
-python inference/predict.py --input-json /tmp/live_snapshot.json
+```text
+User
+  ↓
+Tuwaiq AI UI/CLI
+  ↓
+Python Agent
+  ↓
+LocalModelProvider
+  ↓
+Local Qwen Runtime
+  ↓
+Structured Tool Request
+  ↓
+Rust Broker
+  ↓
+Permission / Policy
+  ↓
+OS
 ```
 
-The output should be a JSON object conforming to
-`system_interface/schemas/inference_output.schema.json` (`anomaly_detected`,
-`anomaly_score`, `severity`, `model_version`, `indicators`, ...), computed
-from a genuine live snapshot of this machine — not the synthetic training
-data.
+Security invariants:
 
-## Fields and known limitations
+- no cloud AI dependency
+- no shell-command tool
+- all OS actions go through the Rust broker
+- sensitive actions require explicit confirmation
+- the model cannot approve its own action
+- model/runtime failure must not crash the broker or the OS
 
-| Field | Source | Notes |
-|---|---|---|
-| `cpu_utilization_pct` | `/proc/stat`, 500ms sample | |
-| `ram_utilization_pct`, `available_ram_mb` | `/proc/meminfo` | |
-| `process_count` | count of numeric entries in `/proc` | |
-| `disk_read_kbps`, `disk_write_kbps` | `/proc/diskstats`, 500ms sample | KB/s (kilobytes), excludes partitions/loop/ram devices to avoid double-counting |
-| `network_in_kbps`, `network_out_kbps` | `/proc/net/dev`, 500ms sample | KB/s (kilobytes), excludes loopback |
-| `uptime_seconds` | `/proc/uptime` | |
-| `error_event_count` | `dmesg --level=err,warn --since=-2min` | **Best-effort.** Returns `0` if `dmesg` is unavailable or unreadable without privilege — `0` here means "no error source was sampled," not necessarily "no errors occurred." See `INTEGRATION.md`'s own convention for unavailable metrics. |
-| `service_state` | threshold heuristic (`service_state.rs`) | v1 only — CPU/RAM/error-count thresholds, not a learned classifier. Documented as future work, same as `INTEGRATION.md` already anticipates. |
+## Model profiles
 
-## Tests
+`agent/model_profiles.py` defines three local Qwen profiles:
 
+- `lite` → Qwen3.5-4B quantized
+- `default` → Qwen3.5-9B quantized (**current default target**)
+- `pro` → Qwen3.5-27B
+
+Model paths can be configured with:
+
+- `TUWAIQ_AI_MODEL_ROOT`
+- `TUWAIQ_AI_MODEL_PATH_LITE`
+- `TUWAIQ_AI_MODEL_PATH_DEFAULT`
+- `TUWAIQ_AI_MODEL_PATH_PRO`
+
+## Confirmation workflow
+
+Sensitive tools such as `close_application` and `kill_process` are model-visible,
+but the Python agent does not execute them immediately.
+
+Flow:
+
+1. Model proposes a structured sensitive tool request.
+2. Agent stores the exact pending action in memory.
+3. Agent asks for explicit `yes/allow/approve` or `no/deny`.
+4. Only an explicit approval on a later turn causes the Rust broker call.
+5. A denial cancels the stored action.
+
+## Process isolation and crash handling
+
+The default local Qwen runtime uses a separate Python child process for the
+model runtime behind a narrow IPC interface:
+
+```text
+Python Agent → LocalModelProvider → isolated model runtime process → llama.cpp / Qwen
 ```
-cargo test                              # unit tests: service_state thresholds
-python -m pytest test_schema_conformance.py -v   # schema validation against the real repo schema
-```
 
-Both suites run against the real compiled binary and real `/proc` data —
-nothing here is mocked.
+The parent runtime performs:
 
-## Phase 6 validation runner
+- startup handshake
+- health check
+- timed inference request
+- unexpected-exit detection
+- bounded repeated-crash protection
+- shutdown / forced termination on timeout
 
-Run the local LLM validation/benchmarking report generator from `AI-Module/`:
+If the model process crashes, hangs, or returns invalid data, the agent falls
+back safely without direct OS access.
+
+## Main commands
+
+From `AI-Module/`:
 
 ```bash
+python -m pytest agent/tests -q
+cd broker && cargo test
 python agent/phase6_validation.py
+python agent/cli.py
 ```
 
-It writes:
+## Real local benchmark
+
+`python agent/phase6_validation.py` writes:
 
 - `evaluation/reports/phase6_local_llm_validation.md`
 - `evaluation/benchmarks/phase6_local_llm_validation.json`
 
-If a required model file is unavailable, the report records the model as `not_run`
-instead of inventing benchmark results.
+Per profile it reports:
+
+- availability: `AVAILABLE` / `NOT AVAILABLE` / `FAILED`
+- PASS/FAIL verdict for the real validation run
+- runtime, hardware profile, latency, RAM/VRAM, CPU/GPU where available
+- tool-calling, structured request validity, context reuse, security, stability
+
+Missing model files are reported as unavailable; results are never fabricated.
+
+## CLI acceptance scenario
+
+When the required model file is present, the intended manual CLI flow is:
+
+1. `Why is my computer slow?`
+2. `What's using the most?`
+3. `Close it.`
+4. explicit confirmation: `yes` or denial: `no`
+
+The diagnosis and final action must stay grounded in broker-returned telemetry.

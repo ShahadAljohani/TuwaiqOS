@@ -30,6 +30,15 @@ class ToolResultEntry:
 
 
 @dataclass
+class PendingConfirmation:
+    """A specific sensitive action awaiting explicit user approval."""
+
+    tool: str
+    arguments: dict[str, Any]
+    description: str
+
+
+@dataclass
 class ConversationTurn:
     """One turn in the conversation history."""
 
@@ -62,8 +71,13 @@ class ConversationContext:
         self._turns: list[ConversationTurn] = []
         # Last explicitly named entity (app/process name).
         self.last_entity: str | None = None
+        # Most recent process list for deterministic "close it"/"kill it"
+        # follow-ups that need a pid, not just a display name.
+        self.last_process_list: list[dict[str, Any]] = []
         # Tool results accumulated during the most recent turn (for follow-ups).
         self.last_tool_results: list[ToolResultEntry] = []
+        # Sensitive tool request pending explicit yes/no approval.
+        self.pending_confirmation: PendingConfirmation | None = None
 
     # ------------------------------------------------------------------
     # Mutation
@@ -98,6 +112,7 @@ class ConversationContext:
         """Extract and cache the most prominent entity from a tool result."""
         if tool == "list_processes":
             processes = result.get("processes") or []
+            self.last_process_list = list(processes)
             if processes:
                 top = sorted(
                     processes, key=lambda p: p.get("cpu_percent", 0.0), reverse=True
@@ -115,6 +130,33 @@ class ConversationContext:
             app_id = result.get("app_id") or ""
             if app_id:
                 self.update_entity(app_id)
+
+    def set_pending_confirmation(
+        self, tool: str, arguments: dict[str, Any], description: str
+    ) -> None:
+        self.pending_confirmation = PendingConfirmation(
+            tool=tool,
+            arguments=dict(arguments),
+            description=description,
+        )
+
+    def clear_pending_confirmation(self) -> None:
+        self.pending_confirmation = None
+
+    def top_process(self) -> dict[str, Any] | None:
+        if self.last_process_list:
+            return dict(self.last_process_list[0])
+        return None
+
+    def find_process(self, name: str) -> dict[str, Any] | None:
+        needle = name.strip().lower()
+        if not needle:
+            return None
+        for process in self.last_process_list:
+            process_name = str(process.get("name", "")).strip().lower()
+            if process_name == needle:
+                return dict(process)
+        return None
 
     # ------------------------------------------------------------------
     # Reference resolution

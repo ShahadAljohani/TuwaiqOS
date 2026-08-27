@@ -22,7 +22,7 @@ import logging
 from typing import Any
 
 from broker_client import BrokerClient, BrokerUnavailableError
-from conversation_context import ConversationContext, ToolResultEntry
+from conversation_context import ConversationContext, PendingConfirmation, ToolResultEntry
 from model_provider import AgentAction, ModelProvider
 from protocol import KNOWN_TOOLS
 
@@ -32,6 +32,9 @@ logger = logging.getLogger("tuwaiq_agent.agent")
 # request.  Prevents runaway loops; 5 is enough for a full system diagnosis
 # (cpu + memory + processes + disk + network if relevant).
 MAX_LOOP_ITERATIONS: int = 5
+SENSITIVE_TOOLS = frozenset({"close_application", "kill_process"})
+CONFIRM_YES = frozenset({"yes", "y", "allow", "approve", "confirm"})
+CONFIRM_NO = frozenset({"no", "n", "deny", "reject", "cancel"})
 
 
 class Agent:
@@ -71,8 +74,12 @@ class Agent:
         - Model failures are caught and do not crash the agent.
         - Broker unavailability surfaces a safe user-facing message.
         """
-        resolved = context.resolve_references(user_message)
         context.add_user_turn(user_message)
+        pending = context.pending_confirmation
+        if pending is not None:
+            return self._handle_confirmation_reply(user_message, context, pending)
+
+        resolved = context.resolve_references(user_message)
 
         accumulated: list[ToolResultEntry] = []
         called_tools: set[str] = set()
@@ -117,6 +124,16 @@ class Agent:
                 break
 
             called_tools.add(tool)
+
+            if tool in SENSITIVE_TOOLS:
+                description = self._describe_sensitive_action(tool, action.arguments, context)
+                context.set_pending_confirmation(tool, action.arguments, description)
+                text = (
+                    f"{description} This requires your explicit confirmation. "
+                    "Reply with yes/allow/approve to continue or no/deny to cancel."
+                )
+                context.add_assistant_turn(text, accumulated)
+                return text
 
             try:
                 response = self._broker.call(tool, action.arguments)
@@ -203,3 +220,79 @@ class Agent:
         if parts:
             return "Here is what I found: " + "; ".join(parts) + "."
         return "I couldn't retrieve the requested information."
+
+    def _handle_confirmation_reply(
+        self,
+        user_message: str,
+        context: ConversationContext,
+        pending: PendingConfirmation,
+    ) -> str:
+        normalized = user_message.strip().lower()
+        if normalized in CONFIRM_NO:
+            context.clear_pending_confirmation()
+            text = f"Okay — I will not proceed. Cancelled: {pending.description}"
+            context.add_assistant_turn(text, [])
+            return text
+
+        if normalized not in CONFIRM_YES:
+            text = (
+                f"I still need an explicit yes/allow/approve or no/deny for this action: "
+                f"{pending.description}"
+            )
+            context.add_assistant_turn(text, [])
+            return text
+
+        context.clear_pending_confirmation()
+        try:
+            response = self._broker.call(pending.tool, pending.arguments)
+        except BrokerUnavailableError as exc:
+            logger.error("broker unavailable during confirmed action: %s", exc)
+            text = "System tools are temporarily unavailable, so I couldn't complete the confirmed action."
+            context.add_assistant_turn(text, [])
+            return text
+
+        entry = ToolResultEntry(
+            tool=pending.tool,
+            result=response.result or {},
+            ok=response.ok,
+            summary=self._summarize_result(pending.tool, response.result, response.ok),
+        )
+        if response.ok:
+            context.update_entity_from_tool_result(pending.tool, response.result or {})
+            text = self._confirmed_success_text(pending, response.result or {})
+            context.add_assistant_turn(text, [entry])
+            return text
+
+        error_message = response.error_message or "the broker rejected the action"
+        text = f"I couldn't complete the confirmed action: {error_message}"
+        context.add_assistant_turn(text, [entry])
+        return text
+
+    @staticmethod
+    def _describe_sensitive_action(
+        tool: str,
+        arguments: dict[str, Any],
+        context: ConversationContext,
+    ) -> str:
+        if tool == "close_application":
+            app_id = str(arguments.get("app_id", "that application"))
+            return f"Tuwaiq AI wants to close {app_id}."
+        if tool == "kill_process":
+            pid = arguments.get("pid", "?")
+            process = context.find_process(str(context.last_entity or "")) or context.top_process() or {}
+            name = process.get("name")
+            if name:
+                return f"Tuwaiq AI wants to terminate {name} (pid {pid})."
+            return f"Tuwaiq AI wants to terminate process pid {pid}."
+        return f"Tuwaiq AI wants to execute {tool}."
+
+    @staticmethod
+    def _confirmed_success_text(
+        pending: PendingConfirmation,
+        result: dict[str, Any],
+    ) -> str:
+        if pending.tool == "close_application":
+            return f"Confirmed — closed {result.get('app_id', 'the application')} (pid {result.get('pid', '?')})."
+        if pending.tool == "kill_process":
+            return f"Confirmed — terminated {result.get('name', 'the process')} (pid {result.get('pid', '?')})."
+        return f"Confirmed — completed {pending.tool}."

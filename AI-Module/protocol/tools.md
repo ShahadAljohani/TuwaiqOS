@@ -11,9 +11,9 @@ itself.
 
 ---
 
-## Read-only tools (Phase 1)
+## Read-only tools
 
-All five below take **no arguments** (`"arguments": {}`) and require no
+All six below take **no arguments** (`"arguments": {}`) and require no
 elevated permission — they only read already-public system state.
 
 ### `get_system_info`
@@ -149,6 +149,35 @@ Result on success:
 ```json
 { "app_id": "firefox", "pid": 5190, "launched": true }
 ```
+
+### `close_application`
+
+**Sensitive.** Requires explicit user confirmation on a separate turn before
+the broker is called.
+
+Arguments:
+```json
+{ "app_id": "firefox" }
+```
+
+- `app_id` must be one of the approved application identifiers.
+- The broker resolves the allowlisted app to its expected process name and
+  refuses unknown apps.
+
+Result on success:
+```json
+{ "app_id": "firefox", "pid": 4821, "name": "firefox", "terminated": true }
+```
+
+### Confirmation gate
+
+`close_application` and `kill_process` share the same workflow:
+
+1. model proposes a structured action request
+2. Python stores the exact pending action
+3. user must explicitly approve or deny on a later turn
+4. only approval triggers the broker call
+5. Rust still applies its own allowlist/protected-process checks
 
 ---
 
