@@ -31,7 +31,7 @@ def test_static_security_checks_cover_required_confirmations() -> None:
     assert checks["no shell access"].passed is True
     assert checks["no direct OS access"].passed is True
     assert checks["no bypass around Rust broker"].passed is True
-    assert checks["sensitive operations require confirmation"].passed is False
+    assert checks["sensitive operations require confirmation"].passed is True
 
 
 def test_run_phase6_validation_marks_missing_models_not_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -40,7 +40,7 @@ def test_run_phase6_validation_marks_missing_models_not_ready(tmp_path: Path, mo
     report = run_phase6_validation()
 
     assert [model.profile_name for model in report.models] == list(MODEL_ORDER)
-    assert all(model.status == "not_run" for model in report.models)
+    assert all(model.status == "NOT AVAILABLE" for model in report.models)
     assert report.readiness_status == "NOT READY"
     assert any("benchmark not run" in issue for issue in report.issues_discovered)
 
@@ -52,7 +52,11 @@ def test_render_markdown_contains_required_deliverable_sections() -> None:
                 profile_name="default",
                 model_id="qwen3.5-9b-instruct-quantized",
                 model_path="/models/default.gguf",
-                status="passed",
+                status="AVAILABLE",
+                validation_verdict="PASS",
+                tested=True,
+                runtime="llama.cpp",
+                hardware="device=cpu, threads=6, gpu_layers=0, min_ram_gb=16",
                 startup_time_ms=100.0,
                 model_loading_time_ms=95.0,
                 inference_latency_ms=250.0,
@@ -61,8 +65,10 @@ def test_render_markdown_contains_required_deliverable_sections() -> None:
                 cpu_usage_percent=65.0,
                 gpu_usage_percent=None,
                 tool_call_success=1.0,
+                structured_tool_request_validity="pass",
                 response_quality="4/4 functional prompts returned non-empty grounded responses.",
-                context_handling="pass: diagnosis → follow-up → open-it flow reused prior context",
+                context_handling="pass: diagnosis → follow-up → close-it → confirmation flow reused prior context",
+                security_result="pass: sensitive action required a separate explicit confirmation turn",
                 stability="pass",
             )
         ],
@@ -82,6 +88,8 @@ def test_render_markdown_contains_required_deliverable_sections() -> None:
 
     for heading in (
         "## 1. Test report",
+        "### UNIT TESTS",
+        "### REAL LOCAL MODEL TESTS",
         "## 2. Model benchmark report",
         "## 3. Security test report",
         "## 4. End-to-end CLI demo results",

@@ -16,6 +16,7 @@ are required.  Runtime failures must NOT propagate to the Agent or Broker.
 from __future__ import annotations
 
 import time
+import os
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,8 @@ from local_model_runtime import (
     InsufficientMemoryError,
     InsufficientRAMError,
     InferenceTimeoutError,
+    InvalidRuntimeResponseError,
+    InferenceError,
     ModelLoadError,
     ModelProcessState,
     QwenLocalRuntime,
@@ -106,6 +109,57 @@ class _FakeBackend:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _ProcessOkBackend:
+    def generate(self, prompt: str, **kwargs: Any) -> str:
+        return "Process OK."
+
+    def close(self) -> None:
+        pass
+
+
+class _ProcessCrashBackend:
+    def generate(self, prompt: str, **kwargs: Any) -> str:
+        raise SystemExit(17)
+
+    def close(self) -> None:
+        pass
+
+
+class _ProcessSlowBackend:
+    def generate(self, prompt: str, **kwargs: Any) -> str:
+        time.sleep(0.3)
+        return "Too slow."
+
+    def close(self) -> None:
+        pass
+
+
+class _ProcessInvalidResponseBackend:
+    def generate(self, prompt: str, **kwargs: Any) -> str:  # type: ignore[override]
+        return ""  # invalid for the runtime contract
+
+    def close(self) -> None:
+        pass
+
+
+def _process_ok_factory(model_path: Path, profile: ModelProfile) -> _ProcessOkBackend:
+    return _ProcessOkBackend()
+
+
+def _process_crash_factory(model_path: Path, profile: ModelProfile) -> _ProcessCrashBackend:
+    return _ProcessCrashBackend()
+
+
+def _process_slow_factory(model_path: Path, profile: ModelProfile) -> _ProcessSlowBackend:
+    return _ProcessSlowBackend()
+
+
+def _process_invalid_response_factory(
+    model_path: Path, profile: ModelProfile
+) -> _ProcessInvalidResponseBackend:
+    return _ProcessInvalidResponseBackend()
 
 
 def _make_profile(
@@ -570,8 +624,119 @@ def test_telemetry_contains_all_phase5_fields(tmp_path: Path) -> None:
         "vram_usage_mb",
         "cpu_usage_percent",
         "gpu_usage_percent",
+        "model_pid",
         "last_error_kind",
         "last_error_message",
         "process_state",
     }
     assert required_fields.issubset(tel.keys())
+
+
+# ---------------------------------------------------------------------------
+# 15. Process-level isolation and recovery
+# ---------------------------------------------------------------------------
+
+
+def test_isolated_runtime_runs_model_in_separate_process(tmp_path: Path) -> None:
+    model_path = tmp_path / "qwen.gguf"
+    model_path.write_bytes(b"GGUF")
+    runtime = QwenLocalRuntime(
+        backend_factory=_process_ok_factory,
+        isolate_model_process=True,
+    )
+    profile = _make_profile(model_path)
+
+    runtime.initialize(profile, tmp_path)
+    tel = runtime.telemetry()
+
+    assert tel["process_state"] == ModelProcessState.READY.value
+    assert tel["model_pid"] is not None
+    assert tel["model_pid"] != os.getpid()
+
+
+def test_isolated_runtime_detects_model_process_exit(tmp_path: Path) -> None:
+    model_path = tmp_path / "qwen.gguf"
+    model_path.write_bytes(b"GGUF")
+    runtime = QwenLocalRuntime(
+        backend_factory=_process_crash_factory,
+        isolate_model_process=True,
+    )
+    provider = LocalModelProvider(profile=_make_profile(model_path), runtime=runtime)
+
+    action = provider.decide("hello")
+
+    assert action.kind in {"respond", "call_tool"}
+    assert provider.telemetry()["process_state"] == ModelProcessState.CRASHED.value
+
+
+def test_isolated_runtime_timeout_terminates_child(tmp_path: Path) -> None:
+    model_path = tmp_path / "qwen.gguf"
+    model_path.write_bytes(b"GGUF")
+    runtime = QwenLocalRuntime(
+        backend_factory=_process_slow_factory,
+        isolate_model_process=True,
+    )
+    profile = _make_profile(model_path, timeout_seconds=0.05)
+
+    runtime.initialize(profile, tmp_path)
+    pid = runtime.telemetry()["model_pid"]
+    with pytest.raises(InferenceTimeoutError):
+        runtime._complete("slow prompt", profile)
+
+    assert runtime.telemetry()["process_state"] == ModelProcessState.CRASHED.value
+    if pid is not None:
+        assert not Path(f"/proc/{pid}").exists()
+
+
+def test_isolated_runtime_rejects_invalid_model_response(tmp_path: Path) -> None:
+    model_path = tmp_path / "qwen.gguf"
+    model_path.write_bytes(b"GGUF")
+    runtime = QwenLocalRuntime(
+        backend_factory=_process_invalid_response_factory,
+        isolate_model_process=True,
+    )
+    profile = _make_profile(model_path)
+
+    runtime.initialize(profile, tmp_path)
+    with pytest.raises(InvalidRuntimeResponseError):
+        runtime._complete("bad response", profile)
+
+    assert runtime.telemetry()["last_error_kind"] == "invalid_response"
+
+
+def test_repeated_crash_protection_stops_restart_loop(tmp_path: Path) -> None:
+    model_path = tmp_path / "qwen.gguf"
+    model_path.write_bytes(b"GGUF")
+    runtime = QwenLocalRuntime(
+        backend_factory=_process_crash_factory,
+        isolate_model_process=True,
+        max_consecutive_failures=2,
+    )
+    provider = LocalModelProvider(profile=_make_profile(model_path), runtime=runtime)
+
+    provider.decide("hello")
+    provider.decide("hello again")
+    provider.decide("hello once more")
+
+    telemetry = provider.telemetry()
+    assert telemetry["process_state"] == ModelProcessState.CRASHED.value
+    assert telemetry["last_error_kind"] in {"inference_failure", "repeated_crash_protection"}
+
+
+def test_restart_after_isolated_runtime_crash_recovers(tmp_path: Path) -> None:
+    model_path = tmp_path / "qwen.gguf"
+    model_path.write_bytes(b"GGUF")
+    runtime = QwenLocalRuntime(
+        backend_factory=_process_crash_factory,
+        isolate_model_process=True,
+        max_consecutive_failures=3,
+    )
+    profile = _make_profile(model_path)
+
+    runtime.initialize(profile, tmp_path)
+    with pytest.raises(InferenceError):
+        runtime._complete("first request", profile)
+
+    runtime._model_backend_factory = _process_ok_factory
+    runtime.restart(profile, tmp_path)
+    assert runtime._complete("second request", profile) == "Process OK."
