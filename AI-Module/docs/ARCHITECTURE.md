@@ -1,146 +1,148 @@
-# Architecture
+# Tuwaiq AI Architecture
 
 ## Scope
 
-This prototype is intentionally isolated under ai_development and is not integrated into TuwaiqOS runtime.
+This directory contains the current local-first Tuwaiq AI implementation for
+TuwaiqOS. The authoritative control flow is:
+
+```text
+User → Tuwaiq AI UI/CLI → Python Agent → LocalModelProvider → Local Qwen Runtime
+     → Structured Tool Request → Rust Broker → Permission/Policy → OS
+```
+
+The agent never executes shell commands or touches the OS directly.
 
 ## Components
 
-1. Tuwaiq AI Assistant (future)
-- User interaction layer.
-- Converts natural language questions into structured intelligence queries.
-- Must pass through policy and permission checks.
+### Python Agent
 
-2. Tuwaiq AI System Intelligence (prototype implemented)
-- Telemetry data collection abstraction.
-- Schema validation.
-- Preprocessing and feature engineering.
-- Isolation Forest anomaly detection.
-- Structured inference and evaluation.
+`agent/agent.py`
 
-## Data and Control Flow
+- runs the bounded reasoning loop
+- validates tool names before they reach Rust
+- holds pending confirmation state for sensitive actions
+- routes every approved tool call through `BrokerClient`
 
-```mermaid
-flowchart LR
-    A[Synthetic Telemetry Generator] --> B[Schema Validation]
-    B --> C[Processed Feature Matrix]
-    C --> D[Isolation Forest Training]
-    D --> E[Exported Model + Metadata]
-    E --> F[Inference Engine]
-    F --> G[Structured Anomaly Output]
+### Conversation state
+
+`agent/conversation_context.py`
+
+- keeps a bounded transcript
+- stores the last resolved entity/process list for follow-up turns
+- stores the exact pending sensitive action awaiting confirmation
+
+### Model abstraction
+
+`agent/model_provider.py`
+
+- `RuleBasedProvider` remains the deterministic fallback for tests and safe degradation
+- `LocalModelProvider` keeps the existing abstraction and delegates to the local runtime
+- model profile selection remains `lite` / `default` / `pro`
+
+### Local Qwen runtime
+
+`agent/local_model_runtime.py`
+
+Default runtime path:
+
+```text
+Agent process
+  ↓ IPC
+isolated model runtime child process
+  ↓
+llama.cpp / llama-cpp-python
+  ↓
+local GGUF Qwen model
 ```
 
-## Future Integration Boundary
+Lifecycle:
 
-```mermaid
-flowchart TD
-    U[User] --> AS[AI Assistant]
-    AS --> CM[Context Manager]
-    CM --> PL[AI Policy Layer]
-    PL --> API[Tuwaiq System API]
-    API --> K[Kernel]
+1. validate profile + model path
+2. preflight RAM/VRAM checks
+3. start isolated child runtime
+4. wait for startup handshake
+5. health check
+6. send inference request with timeout
+7. receive validated response
+8. shutdown or terminate on failure
 
-    LLM[LLM] --> TC[Structured Tool Call]
-    TC --> PV[Permission Validation]
-    PV --> API
-```
+Handled failures:
 
-Security boundary:
-- LLM must not directly call kernel internals.
-- Policy validation gate is mandatory.
+- missing model file
+- invalid model path
+- startup failure
+- invalid runtime response
+- broken IPC
+- inference timeout
+- repeated crashes
+- child process unexpected exit
+- OOM where detectable
 
-## Agent ModelProvider boundary (Phase 2: Local Qwen Integration)
+The runtime records process state plus load/inference telemetry and clears dead
+backends so the agent does not stay blocked on a broken model process.
 
-The Python agent orchestration remains unchanged:
+### Rust broker
 
-User → Python Agent → `ModelProvider` → Structured Tool Request → Rust Broker → Permission/Policy → OS
+`broker/src/*`
 
-- `agent.py` depends only on the abstract `ModelProvider` interface.
-- `RuleBasedProvider` remains available for deterministic tests/mocks.
-- `LocalModelProvider` now exists as the local Qwen entry point and:
-  - holds a selected model profile (`lite`, `default`, `pro`),
-  - validates model/runtime configuration safely,
-  - delegates model loading/inference/shutdown to `QwenLocalRuntime`,
-  - preserves the existing `RuleBasedProvider` fallback for deterministic tests and current tool-routing behavior.
+- final execution boundary for OS access
+- fixed tool registry
+- argument validation
+- allowlist enforcement for app launch/close
+- protected-process denial for `kill_process`
+- audit logging
 
-### Runtime selected
+Rust remains the final authority for tool execution.
 
-Phase 2 uses `llama.cpp` via the Python `llama-cpp-python` binding.
+## Confirmation workflow
 
-Why this runtime:
+Sensitive tools currently include:
 
-- runs fully offline after local installation,
-- supports quantized GGUF Qwen models,
-- keeps model execution inside the Python local-runtime layer,
-- does not require cloud APIs or changes to the Rust broker security boundary.
+- `close_application`
+- `kill_process`
 
-### Model Profile concept
+Flow:
 
-Model profiles describe configuration without changing agent logic. Each profile
-includes:
+1. Model or fallback provider proposes the tool request.
+2. Agent stores `{tool, arguments, description}` as a pending action.
+3. Agent asks the user for explicit approval.
+4. Only `yes/allow/approve/confirm` on the next turn executes the broker call.
+5. `no/deny/reject/cancel` clears the request without execution.
+6. Any other reply leaves the request pending.
 
-- model identifier
-- model path/location
-- runtime configuration
-- quantization information
-- context configuration
-- generation configuration
-- hardware/resource requirements
+This keeps approval tied to a specific action request and prevents the model
+from self-authorizing.
 
-Planned profile mapping for local models:
+## Model profiles
 
-- `lite` → Qwen3.5-4B quantized (`qwen3.5-4b-quantized.gguf`)
-- `default` → Qwen3.5-9B quantized (`qwen3.5-9b-quantized.gguf`) and this is the V1 default
-- `pro` → Qwen3.5-27B (`qwen3.5-27b.gguf`)
+`agent/model_profiles.py`
 
-Model paths are configured centrally:
+- `lite` → Qwen3.5-4B quantized
+- `default` → Qwen3.5-9B quantized (**default target**)
+- `pro` → Qwen3.5-27B
 
-- built-in relative model file names live in `agent/model_profiles.py`,
-- `TUWAIQ_AI_MODEL_ROOT` overrides the local model directory for all profiles,
-- `TUWAIQ_AI_MODEL_PATH_LITE`, `TUWAIQ_AI_MODEL_PATH_DEFAULT`, and `TUWAIQ_AI_MODEL_PATH_PRO` can override individual profile paths.
+The model files remain local-only. No cloud provider is required.
 
-### Local loading flow
+## Validation and benchmark flow
 
-`Agent` → `LocalModelProvider` → `QwenLocalRuntime` → `llama.cpp` (`llama-cpp-python`) → local GGUF Qwen model
+`agent/phase6_validation.py`
 
-1. `LocalModelProvider` selects the `lite`, `default`, or `pro` profile.
-2. `QwenLocalRuntime` resolves the configured model path.
-3. The runtime validates that the profile uses a GGUF file and a compatible `llama.cpp` engine.
-4. The runtime lazily loads the model on first inference, records load time, and exposes process RAM/CPU plus inference latency telemetry.
-5. Tool execution still goes through the Rust broker only; the model never executes shell commands or bypasses the broker.
+The Phase 6 runner:
 
-### Local smoke test
+- probes `lite`, `default`, and `pro`
+- reports model availability as `AVAILABLE`, `NOT AVAILABLE`, or `FAILED`
+- performs real local inference only when the model file exists
+- records latency/resource telemetry where available
+- verifies diagnosis, follow-up context, and confirmation-gated close flow
+- writes markdown and JSON reports under `evaluation/`
 
-Run from `AI-Module/` after installing dependencies and placing the default GGUF model on disk:
+## Test entry points
+
+From `AI-Module/`:
 
 ```bash
-export TUWAIQ_AI_MODEL_PATH_DEFAULT=/absolute/path/to/qwen3.5-9b-quantized.gguf
-export TUWAIQ_RUN_QWEN_SMOKE=1
-python -m pytest agent/tests/test_qwen_smoke.py -q
+python -m pytest agent/tests -q
+cd broker && cargo test
+python agent/phase6_validation.py
+python agent/cli.py
 ```
-
-This verifies the simple offline path:
-
-`Hello` → Qwen local runtime → non-empty response
-
-### Limitations and Phase 3 follow-ups
-
-- Current V1 integration is CPU-first by default; GPU offload is only available through explicit profile/runtime configuration.
-- VRAM/GPU telemetry is exposed as unavailable when the backend does not provide it directly.
-- Timeout handling is defensive at the provider/runtime boundary, but hard cancellation of a native inference already in progress is left for a later phase.
-- Full model-driven structured tool calling is intentionally deferred; Phase 2 keeps the existing broker and tool boundaries unchanged.
-
-The Agent must not depend directly on Qwen (or any concrete model). Keeping
-model details inside provider/profile/runtime layers preserves the Rust broker
-security boundary and allows future model replacement without rewriting agent
-or broker orchestration.
-
-## Telemetry Availability Statement
-
-Current implementation uses synthetic telemetry only.
-Any metric that depends on runtime kernel signals is treated as future integration requirement.
-
-## Detection vs Diagnosis
-
-- Detection: identifies statistically unusual behavior.
-- Diagnosis: requires additional causal system instrumentation and is not claimed by this prototype.

@@ -37,7 +37,7 @@ from tool_call_parser import (
     is_tool_call,
     parse_tool_call,
 )
-from tool_schemas import TOOL_SCHEMA_BY_NAME, TOOL_SCHEMAS
+from tool_schemas import TOOL_RESULT_CONTRACTS, TOOL_SCHEMA_BY_NAME, TOOL_SCHEMAS
 
 
 # ---------------------------------------------------------------------------
@@ -51,29 +51,35 @@ class _FakeBroker:
         "get_memory_info": {
             "total_bytes": 16_000_000_000,
             "used_bytes": 9_000_000_000,
-            "available_bytes": 7_000_000_000,
             "used_percent": 56.25,
             "top_consumers": [{"name": "firefox", "bytes": 1_500_000_000}],
         },
-        "get_cpu_info": {"usage_percent": 42.0, "core_count": 8},
+        "get_cpu_info": {
+            "model": "Test CPU",
+            "usage_percent": 42.0,
+            "core_count": 8,
+            "per_core_usage_percent": [42.0] * 8,
+        },
         "get_disk_info": {
             "volumes": [{"mount_point": "/", "used_percent": 70.0, "total_bytes": 500_000_000_000}]
         },
         "list_processes": {
             "processes": [
-                {"pid": 1234, "name": "chrome", "cpu_percent": 30.0, "memory_percent": 5.0},
-                {"pid": 5678, "name": "firefox", "cpu_percent": 10.0, "memory_percent": 3.0},
+                {"pid": 1234, "name": "chrome", "cpu_percent": 30.0, "memory_bytes": 5_000_000},
+                {"pid": 5678, "name": "firefox", "cpu_percent": 10.0, "memory_bytes": 3_000_000},
             ]
         },
-        "get_network_status": {"interfaces": [{"name": "eth0", "ip": "192.168.1.10"}]},
+        "get_network_status": {"interfaces": [{"name": "eth0", "rx_kbps": 12.0, "tx_kbps": 3.0}]},
         "get_system_info": {
             "hostname": "tuwaiq-box",
-            "os_name": "Linux",
-            "os_version": "5.15",
+            "os_name": "TuwaiqOS",
+            "os_version": "v0.5",
             "kernel_version": "5.15.0",
             "uptime_seconds": 3600,
         },
-        "launch_application": {"app_id": "firefox", "pid": 9999},
+        "launch_application": {"app_id": "firefox", "pid": 9999, "launched": True},
+        "close_application": {"app_id": "firefox", "pid": 9999, "name": "firefox", "terminated": True},
+        "kill_process": {"pid": 1234, "name": "chrome", "terminated": True},
     }
 
     def call(self, tool: str, arguments: dict | None = None) -> ToolResponse:
@@ -155,6 +161,18 @@ def test_launch_application_schema_has_app_id_enum() -> None:
     schema = TOOL_SCHEMA_BY_NAME["launch_application"]
     app_id_prop = schema["parameters"]["properties"]["app_id"]
     assert set(app_id_prop["enum"]) == {"firefox", "vscode", "terminal", "file_manager"}
+
+
+def test_sensitive_tool_schemas_require_exact_arguments() -> None:
+    assert TOOL_SCHEMA_BY_NAME["kill_process"]["parameters"]["required"] == ["pid"]
+    assert TOOL_SCHEMA_BY_NAME["close_application"]["parameters"]["required"] == ["app_id"]
+    assert TOOL_SCHEMA_BY_NAME["kill_process"]["parameters"]["additionalProperties"] is False
+    assert TOOL_SCHEMA_BY_NAME["close_application"]["parameters"]["additionalProperties"] is False
+
+
+def test_fake_tool_results_match_runtime_contracts() -> None:
+    for tool_name, result in _FakeBroker._RESULTS.items():
+        assert set(result.keys()) == set(TOOL_RESULT_CONTRACTS[tool_name])
 
 
 # ===========================================================================
@@ -271,6 +289,11 @@ def test_arguments_not_dict_raises() -> None:
 def test_missing_required_arg_raises() -> None:
     with pytest.raises(InvalidArgumentsError):
         parse_tool_call(json.dumps({"tool": "launch_application", "arguments": {}}))
+
+
+def test_missing_required_pid_for_kill_process_raises() -> None:
+    with pytest.raises(InvalidArgumentsError):
+        parse_tool_call(json.dumps({"tool": "kill_process", "arguments": {}}))
 
 
 # ===========================================================================

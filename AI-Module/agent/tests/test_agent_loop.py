@@ -35,29 +35,35 @@ _FAKE_RESULTS: dict[str, dict[str, Any]] = {
     "get_memory_info": {
         "total_bytes": 16_000_000_000,
         "used_bytes": 9_000_000_000,
-        "available_bytes": 7_000_000_000,
         "used_percent": 56.25,
         "top_consumers": [{"name": "firefox", "bytes": 1_500_000_000}],
     },
-    "get_cpu_info": {"usage_percent": 42.0, "core_count": 8},
+    "get_cpu_info": {
+        "model": "Test CPU",
+        "usage_percent": 42.0,
+        "core_count": 8,
+        "per_core_usage_percent": [42.0] * 8,
+    },
     "get_disk_info": {
         "volumes": [{"mount_point": "/", "used_percent": 70.0, "total_bytes": 500_000_000_000}]
     },
     "list_processes": {
         "processes": [
-            {"pid": 1234, "name": "chrome", "cpu_percent": 30.0, "memory_percent": 5.0},
-            {"pid": 5678, "name": "firefox", "cpu_percent": 10.0, "memory_percent": 3.0},
+            {"pid": 1234, "name": "chrome", "cpu_percent": 30.0, "memory_bytes": 5_000_000},
+            {"pid": 5678, "name": "firefox", "cpu_percent": 10.0, "memory_bytes": 3_000_000},
         ]
     },
-    "get_network_status": {"interfaces": [{"name": "eth0", "ip": "192.168.1.10"}]},
+    "get_network_status": {"interfaces": [{"name": "eth0", "rx_kbps": 12.0, "tx_kbps": 3.0}]},
     "get_system_info": {
         "hostname": "tuwaiq-box",
-        "os_name": "Linux",
-        "os_version": "5.15",
+        "os_name": "TuwaiqOS",
+        "os_version": "v0.5",
         "kernel_version": "5.15.0",
         "uptime_seconds": 3600,
     },
-    "launch_application": {"app_id": "firefox", "pid": 9999},
+    "launch_application": {"app_id": "firefox", "pid": 9999, "launched": True},
+    "close_application": {"app_id": "firefox", "pid": 9999, "name": "firefox", "terminated": True},
+    "kill_process": {"pid": 1234, "name": "chrome", "terminated": True},
 }
 
 
@@ -143,6 +149,11 @@ class _TimeoutBroker:
 
     def call(self, tool: str, arguments: dict | None = None) -> ToolResponse:
         raise BrokerUnavailableError("broker timed out")
+
+
+class _RecordingBroker(_FakeBroker):
+    def call(self, tool: str, arguments: dict | None = None) -> ToolResponse:
+        return super().call(tool, arguments)
 
 
 # ===========================================================================
@@ -276,6 +287,87 @@ def test_loop_terminates_on_unknown_tool() -> None:
     # Broker must never be called for an unknown tool.
     assert broker.call_log == []
     assert response
+
+
+# ===========================================================================
+# 4b. Confirmation workflow for sensitive tools
+# ===========================================================================
+
+def test_sensitive_tool_requires_confirmation_before_execution() -> None:
+    provider = _SequenceProvider(
+        [AgentAction(kind="call_tool", tool="close_application", arguments={"app_id": "firefox"})]
+    )
+    broker = _RecordingBroker()
+    agent = Agent(model=provider, broker=broker)  # type: ignore[arg-type]
+    context = ConversationContext()
+
+    response = agent.handle_with_context("Close Firefox.", context)
+
+    assert "requires your explicit confirmation" in response
+    assert context.pending_confirmation is not None
+    assert broker.call_log == []
+
+
+def test_sensitive_tool_executes_after_confirmation() -> None:
+    provider = _SequenceProvider(
+        [AgentAction(kind="call_tool", tool="close_application", arguments={"app_id": "firefox"})]
+    )
+    broker = _RecordingBroker()
+    agent = Agent(model=provider, broker=broker)  # type: ignore[arg-type]
+    context = ConversationContext()
+
+    agent.handle_with_context("Close Firefox.", context)
+    response = agent.handle_with_context("yes", context)
+
+    assert "Confirmed" in response
+    assert broker.call_log == ["close_application"]
+    assert context.pending_confirmation is None
+
+
+def test_sensitive_tool_denied_is_not_executed() -> None:
+    provider = _SequenceProvider(
+        [AgentAction(kind="call_tool", tool="kill_process", arguments={"pid": 1234})]
+    )
+    broker = _RecordingBroker()
+    agent = Agent(model=provider, broker=broker)  # type: ignore[arg-type]
+    context = ConversationContext()
+
+    agent.handle_with_context("Kill process 1234.", context)
+    response = agent.handle_with_context("deny", context)
+
+    assert "Cancelled" in response
+    assert broker.call_log == []
+    assert context.pending_confirmation is None
+
+
+def test_invalid_confirmation_does_not_authorize_action() -> None:
+    provider = _SequenceProvider(
+        [AgentAction(kind="call_tool", tool="kill_process", arguments={"pid": 1234})]
+    )
+    broker = _RecordingBroker()
+    agent = Agent(model=provider, broker=broker)  # type: ignore[arg-type]
+    context = ConversationContext()
+
+    agent.handle_with_context("Kill process 1234.", context)
+    response = agent.handle_with_context("maybe later", context)
+
+    assert "I still need an explicit" in response
+    assert broker.call_log == []
+    assert context.pending_confirmation is not None
+
+
+def test_model_cannot_bypass_confirmation_with_direct_sensitive_tool_call() -> None:
+    provider = _SequenceProvider(
+        [AgentAction(kind="call_tool", tool="kill_process", arguments={"pid": 1234})]
+    )
+    broker = _RecordingBroker()
+    agent = Agent(model=provider, broker=broker)  # type: ignore[arg-type]
+    context = ConversationContext()
+
+    response = agent.handle_with_context("Do the dangerous thing.", context)
+
+    assert "explicit confirmation" in response
+    assert broker.call_log == []
 
 
 # ===========================================================================
@@ -443,10 +535,11 @@ def test_close_it_does_not_bypass_broker() -> None:
     context = ConversationContext()
     context.update_entity("terminal")
 
-    # Even if context is set, the agent must never call OS directly.
-    agent.handle_with_context("Close it", context)
-    # No assertion on broker calls here -- the key check is that we haven't
-    # crashed or executed any direct OS call.
+    response = agent.handle_with_context("Close it", context)
+
+    assert "explicit confirmation" in response
+    assert broker.call_log == []
+    assert context.pending_confirmation is not None
 
 
 # ===========================================================================

@@ -263,6 +263,8 @@ class RuleBasedProvider(ModelProvider):
     ]
     _PROCESS_PATTERNS = [r"\bprocess(es)?\b", r"what.*running", r"consum(ing|es)"]
     _LAUNCH_PATTERNS = [r"\bopen\b", r"\blaunch\b", r"\bstart\b"]
+    _CLOSE_PATTERNS = [r"\bclose\b", r"\bquit\b", r"\bstop\b"]
+    _KILL_PATTERNS = [r"\bkill\b", r"\bterminate\b"]
 
     # Maps free-text app mentions to the broker's allowlisted app_ids. This
     # is a UX convenience mapping only -- the broker independently enforces
@@ -289,6 +291,10 @@ class RuleBasedProvider(ModelProvider):
 
     def decide(self, user_message: str) -> AgentAction:
         text = user_message.lower().strip()
+
+        sensitive = self._match_sensitive_action(text)
+        if sensitive is not None:
+            return sensitive
 
         launch_match = self._match_launch(text)
         if launch_match is not None:
@@ -344,6 +350,10 @@ class RuleBasedProvider(ModelProvider):
 
         called = {e.tool for e in accumulated}
 
+        sensitive = self._match_sensitive_action(text, context=context)
+        if sensitive is not None:
+            return sensitive
+
         if is_diagnosis:
             # Return the next uncalled diagnosis tool, or respond if all done.
             for tool in self._DIAGNOSIS_TOOLS:
@@ -393,9 +403,65 @@ class RuleBasedProvider(ModelProvider):
     def _match_launch(self, text: str) -> str | None:
         if not any(re.search(p, text) for p in self._LAUNCH_PATTERNS):
             return None
+        return self._match_app_alias(text)
+
+    def _match_app_alias(self, text: str) -> str | None:
         for alias, app_id in self._APP_ALIASES.items():
             if alias in text:
                 return app_id
+        return None
+
+    def _match_sensitive_action(
+        self,
+        text: str,
+        *,
+        context: "ConversationContext | None" = None,
+    ) -> AgentAction | None:
+        pid_match = re.search(r"\b(?:pid|process)\s+(\d+)\b", text)
+        if pid_match and any(re.search(p, text) for p in self._KILL_PATTERNS + self._CLOSE_PATTERNS):
+            return AgentAction(
+                kind="call_tool",
+                tool="kill_process",
+                arguments={"pid": int(pid_match.group(1))},
+            )
+
+        app_id = self._match_app_alias(text)
+        if app_id is not None and any(re.search(p, text) for p in self._CLOSE_PATTERNS):
+            return AgentAction(
+                kind="call_tool",
+                tool="close_application",
+                arguments={"app_id": app_id},
+            )
+
+        if context is None or not any(
+            re.search(p, text) for p in self._CLOSE_PATTERNS + self._KILL_PATTERNS
+        ):
+            return None
+
+        entity = context.last_entity or ""
+        if entity:
+            resolved_app = self._match_app_alias(entity)
+            if resolved_app is not None and any(re.search(p, text) for p in self._CLOSE_PATTERNS):
+                return AgentAction(
+                    kind="call_tool",
+                    tool="close_application",
+                    arguments={"app_id": resolved_app},
+                )
+            process = context.find_process(entity)
+            if process is not None and "pid" in process:
+                return AgentAction(
+                    kind="call_tool",
+                    tool="kill_process",
+                    arguments={"pid": int(process["pid"])},
+                )
+
+        top_process = context.top_process()
+        if top_process is not None and "pid" in top_process:
+            return AgentAction(
+                kind="call_tool",
+                tool="kill_process",
+                arguments={"pid": int(top_process["pid"])},
+            )
         return None
 
     def explain(self, user_message: str, tool: str, result: dict[str, Any]) -> str:
@@ -432,6 +498,12 @@ class RuleBasedProvider(ModelProvider):
 
         if tool == "launch_application":
             return f"Opened {result['app_id']} (pid {result['pid']})."
+
+        if tool == "close_application":
+            return f"Closed {result['app_id']} (pid {result['pid']})."
+
+        if tool == "kill_process":
+            return f"Terminated process {result['name']} (pid {result['pid']})."
 
         return f"Done: {result}"
 
